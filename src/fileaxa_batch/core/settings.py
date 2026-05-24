@@ -12,13 +12,13 @@ class Mode(str, Enum):
     API = "api"
 
 
-def _config_dir() -> Path:
+def config_dir() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     return Path(base) / "fileaxa-batch"
 
 
 def _config_path() -> Path:
-    return _config_dir() / "settings.json"
+    return config_dir() / "settings.json"
 
 
 def _default_download_dir() -> Path:
