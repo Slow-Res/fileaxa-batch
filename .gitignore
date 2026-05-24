@@ -22,6 +22,8 @@ cookies.json
 .DS_Store
 .vscode/
 .idea/
+.claude/
+.remember/
 
 # Ad-hoc recon / e2e scripts
 _recon*.py
