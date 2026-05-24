@@ -26,6 +26,9 @@ fileaxa-batch = "fileaxa_batch.app:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+fileaxa_batch = ["data/*.db"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
