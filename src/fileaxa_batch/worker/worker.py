@@ -15,6 +15,28 @@ from .browser import CancelledError, download_one
 from .signals import WorkerSignals
 
 
+class JobClaimer:
+    """Atomic 'find a PENDING job and mark it taken' across concurrent workers.
+
+    Without this lock, two workers can both observe the same PENDING row in
+    the gap before either flips its status, and end up downloading the same
+    file twice. Flipping straight to NAVIGATING serves as the claim marker —
+    the per-job status callbacks overwrite it within milliseconds.
+    """
+
+    def __init__(self, jobs: List[DownloadJob]) -> None:
+        self._jobs = jobs
+        self._lock = threading.Lock()
+
+    def claim_next(self) -> Optional[int]:
+        with self._lock:
+            for i, job in enumerate(self._jobs):
+                if job.status == JobStatus.PENDING:
+                    job.status = JobStatus.NAVIGATING
+                    return i
+            return None
+
+
 def _status_to_enum(s: str) -> JobStatus:
     s = s.lower()
     if "navigating" in s:
@@ -41,12 +63,16 @@ class DownloadWorker(QThread):
         signals: WorkerSignals,
         jobs: List[DownloadJob],
         settings: AppSettings,
+        claimer: JobClaimer,
+        worker_id: int = 1,
         parent=None,
     ):
         super().__init__(parent)
         self.signals = signals
         self.jobs = jobs
         self.settings = settings
+        self.claimer = claimer
+        self.worker_id = worker_id
         self._stop = threading.Event()
         self._cancel_current = threading.Event()
         self._paused = threading.Event()
@@ -88,7 +114,7 @@ class DownloadWorker(QThread):
         finally:
             if api_client is not None:
                 api_client.close()
-            self.signals.worker_stopped.emit()
+            self.signals.worker_stopped.emit(self.worker_id)
 
     def _open_api_client_if_enabled(self) -> Optional[FileaxaClient]:
         if self.settings.mode != Mode.API:
@@ -119,19 +145,13 @@ class DownloadWorker(QThread):
                 if self._stop.wait(timeout=0.5):
                     break
                 continue
-            idx = self._next_pending_index()
+            idx = self.claimer.claim_next()
             if idx is None:
                 if self._stop.wait(timeout=0.5):
                     break
                 continue
             self._cancel_current.clear()
             self._process(idx, page, api_client)
-
-    def _next_pending_index(self) -> Optional[int]:
-        for i, job in enumerate(self.jobs):
-            if job.status == JobStatus.PENDING:
-                return i
-        return None
 
     def _emit_quota(self, info: dict) -> None:
         if not info:
