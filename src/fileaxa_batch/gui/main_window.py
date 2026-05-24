@@ -1,0 +1,284 @@
+from __future__ import annotations
+
+import subprocess
+import sys
+from typing import List, Optional
+
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSplitter,
+    QStatusBar,
+    QTableView,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ..core.models import DownloadJob, FileMeta, JobStatus
+from ..core.settings import AppSettings, Mode
+from ..core.urls import parse_file_code
+from ..worker.signals import WorkerSignals
+from ..worker.worker import DownloadWorker
+from .queue_model import QueueModel
+from .settings_dialog import SettingsDialog
+from .widgets import UrlInput
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, settings: AppSettings):
+        super().__init__()
+        self.setWindowTitle("fileaxa-batch")
+        self.resize(980, 660)
+
+        self._settings = settings
+        self._jobs: List[DownloadJob] = []
+        self._model = QueueModel(self._jobs)
+        self._signals = WorkerSignals()
+        self._worker: Optional[DownloadWorker] = None
+
+        self._build_ui()
+        self._wire_signals()
+
+    # ---------- UI ----------
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        # Toolbar row
+        bar = QHBoxLayout()
+        self._add_btn = QPushButton("Add to queue")
+        self._start_btn = QPushButton("Start")
+        self._pause_btn = QPushButton("Pause")
+        self._cancel_btn = QPushButton("Cancel current")
+        self._clear_btn = QPushButton("Clear finished")
+        self._open_btn = QPushButton("Open downloads")
+        self._settings_btn = QPushButton("Settings…")
+        for b in (
+            self._add_btn,
+            self._start_btn,
+            self._pause_btn,
+            self._cancel_btn,
+            self._clear_btn,
+            self._open_btn,
+            self._settings_btn,
+        ):
+            bar.addWidget(b)
+        bar.addStretch(1)
+        root.addLayout(bar)
+
+        # Split: URL input / queue table / log
+        split = QSplitter(Qt.Orientation.Vertical)
+
+        self._url_input = UrlInput()
+        split.addWidget(self._url_input)
+
+        self._table = QTableView()
+        self._table.setModel(self._model)
+        self._table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self._table.setAlternatingRowColors(True)
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(QueueModel.COL_URL, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(QueueModel.COL_NAME, QHeaderView.ResizeMode.Stretch)
+        split.addWidget(self._table)
+
+        self._log = QPlainTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setMaximumBlockCount(500)
+        split.addWidget(self._log)
+
+        split.setSizes([120, 400, 120])
+        root.addWidget(split, 1)
+
+        # Status bar
+        sb = QStatusBar()
+        self.setStatusBar(sb)
+        self._mode_label = QLabel()
+        self._quota_label = QLabel()
+        sb.addWidget(self._mode_label)
+        sb.addPermanentWidget(self._quota_label)
+        self._refresh_mode_label()
+
+        self.setCentralWidget(central)
+
+        self._add_btn.clicked.connect(self._on_add)
+        self._start_btn.clicked.connect(self._on_start)
+        self._pause_btn.clicked.connect(self._on_pause)
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        self._clear_btn.clicked.connect(self._on_clear)
+        self._open_btn.clicked.connect(self._on_open_downloads)
+        self._settings_btn.clicked.connect(self._on_settings)
+
+        self._set_running_state(False)
+
+    def _wire_signals(self) -> None:
+        s = self._signals
+        s.job_started.connect(self._on_job_started)
+        s.metadata_ready.connect(self._on_metadata_ready)
+        s.status_changed.connect(self._on_status_changed)
+        s.progress.connect(self._on_progress)
+        s.job_completed.connect(self._on_job_completed)
+        s.job_failed.connect(self._on_job_failed)
+        s.quota_updated.connect(self._on_quota_updated)
+        s.worker_log.connect(self._append_log)
+        s.worker_stopped.connect(self._on_worker_stopped)
+
+    # ---------- Buttons ----------
+
+    def _on_add(self) -> None:
+        text = self._url_input.toPlainText().strip()
+        if not text:
+            return
+        added = 0
+        skipped = 0
+        for line in text.splitlines():
+            url = line.strip()
+            if not url or url.startswith("#"):
+                continue
+            code = parse_file_code(url)
+            if not code:
+                skipped += 1
+                continue
+            self._model.add_job(DownloadJob(url=url, file_code=code))
+            added += 1
+        self._url_input.clear()
+        msg = f"queued {added} URL(s)"
+        if skipped:
+            msg += f"; skipped {skipped} invalid"
+        self._append_log(msg)
+
+    def _on_start(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.resume()
+            self._set_running_state(True)
+            self._append_log("resumed")
+            return
+        if not any(j.status == JobStatus.PENDING for j in self._jobs):
+            QMessageBox.information(
+                self, "Nothing to do", "Queue is empty or has no pending items."
+            )
+            return
+        self._worker = DownloadWorker(self._signals, self._jobs, self._settings)
+        self._worker.start()
+        self._set_running_state(True)
+        self._append_log("worker started")
+
+    def _on_pause(self) -> None:
+        if self._worker:
+            self._worker.pause()
+            self._append_log("paused — will stop after current job")
+
+    def _on_cancel(self) -> None:
+        if self._worker:
+            self._worker.cancel_current()
+            self._append_log("cancel requested for current job")
+
+    def _on_clear(self) -> None:
+        self._model.remove_finished()
+
+    def _on_open_downloads(self) -> None:
+        d = self._settings.download_dir
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform.startswith("linux"):
+                subprocess.Popen(["xdg-open", str(d)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(d)])
+            elif sys.platform.startswith("win"):
+                subprocess.Popen(["explorer", str(d)])
+        except OSError as e:
+            QMessageBox.warning(self, "Open folder failed", str(e))
+
+    def _on_settings(self) -> None:
+        dlg = SettingsDialog(self._settings, self)
+        if dlg.exec():
+            self._refresh_mode_label()
+
+    # ---------- Worker signals ----------
+
+    def _on_job_started(self, idx: int) -> None:
+        self._model.refresh_row(idx)
+        self._table.selectRow(idx)
+        self._table.scrollTo(self._model.index(idx, 0))
+
+    def _on_metadata_ready(self, idx: int, name: str, size: int) -> None:
+        if 0 <= idx < len(self._jobs):
+            self._jobs[idx].meta = FileMeta(
+                file_code=self._jobs[idx].file_code,
+                name=name or None,
+                size=size if size >= 0 else None,
+            )
+            self._model.refresh_row(idx)
+
+    def _on_status_changed(self, idx: int, status: str) -> None:
+        if 0 <= idx < len(self._jobs):
+            self._model.refresh_row(idx)
+        if "captcha" in status.lower():
+            self.statusBar().showMessage(
+                "⏳ Solve CAPTCHA in the Chromium window", 0
+            )
+        elif "timer" in status.lower():
+            self.statusBar().showMessage(f"⌛ {status}", 0)
+        else:
+            self.statusBar().showMessage(status, 0)
+
+    def _on_progress(self, idx: int, done: int, total: int) -> None:
+        if 0 <= idx < len(self._jobs):
+            self._jobs[idx].bytes_done = done
+            self._model.refresh_row(idx)
+
+    def _on_job_completed(self, idx: int, path: str) -> None:
+        self._model.refresh_row(idx)
+        self._append_log(f"✓ {path}")
+
+    def _on_job_failed(self, idx: int, err: str) -> None:
+        self._model.refresh_row(idx)
+        self._append_log(f"✗ row {idx + 1}: {err}")
+
+    def _on_quota_updated(self, text: str) -> None:
+        self._quota_label.setText(text)
+
+    def _on_worker_stopped(self) -> None:
+        self._append_log("worker stopped")
+        self._set_running_state(False)
+        self._worker = None
+
+    # ---------- helpers ----------
+
+    def _append_log(self, line: str) -> None:
+        self._log.appendPlainText(line)
+
+    def _refresh_mode_label(self) -> None:
+        m = "Anonymous" if self._settings.mode == Mode.ANONYMOUS else "API key"
+        self._mode_label.setText(
+            f"Mode: {m}  ·  Dir: {self._settings.download_dir}"
+        )
+
+    def _set_running_state(self, running: bool) -> None:
+        self._start_btn.setEnabled(not running)
+        self._pause_btn.setEnabled(running)
+        self._cancel_btn.setEnabled(running)
+
+    # ---------- close ----------
+
+    def closeEvent(self, event):
+        if self._worker is not None and self._worker.isRunning():
+            ans = QMessageBox.question(
+                self,
+                "Worker running",
+                "A download is in progress. Stop and exit?",
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self._worker.request_stop()
+            self._worker.wait(5000)
+        event.accept()
