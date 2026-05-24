@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from typing import List, Optional
+from typing import List
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -24,10 +24,12 @@ from ..core.models import DownloadJob, FileMeta, JobStatus
 from ..core.settings import AppSettings, Mode
 from ..core.urls import parse_file_code
 from ..worker.signals import WorkerSignals
-from ..worker.worker import DownloadWorker
+from ..worker.worker import DownloadWorker, JobClaimer
 from .queue_model import QueueModel
 from .settings_dialog import SettingsDialog
 from .widgets import UrlInput
+
+MAX_WORKERS = 4
 
 
 class MainWindow(QMainWindow):
@@ -40,7 +42,9 @@ class MainWindow(QMainWindow):
         self._jobs: List[DownloadJob] = []
         self._model = QueueModel(self._jobs)
         self._signals = WorkerSignals()
-        self._worker: Optional[DownloadWorker] = None
+        self._workers: List[DownloadWorker] = []
+        self._claimer = JobClaimer(self._jobs)
+        self._next_worker_id = 1
 
         self._build_ui()
         self._wire_signals()
@@ -56,6 +60,7 @@ class MainWindow(QMainWindow):
         bar = QHBoxLayout()
         self._add_btn = QPushButton("Add to queue")
         self._start_btn = QPushButton("Start")
+        self._spawn_btn = QPushButton(self._spawn_btn_label(0))
         self._pause_btn = QPushButton("Pause")
         self._cancel_btn = QPushButton("Cancel current")
         self._clear_btn = QPushButton("Clear finished")
@@ -64,6 +69,7 @@ class MainWindow(QMainWindow):
         for b in (
             self._add_btn,
             self._start_btn,
+            self._spawn_btn,
             self._pause_btn,
             self._cancel_btn,
             self._clear_btn,
@@ -111,13 +117,14 @@ class MainWindow(QMainWindow):
 
         self._add_btn.clicked.connect(self._on_add)
         self._start_btn.clicked.connect(self._on_start)
+        self._spawn_btn.clicked.connect(self._on_spawn)
         self._pause_btn.clicked.connect(self._on_pause)
         self._cancel_btn.clicked.connect(self._on_cancel)
         self._clear_btn.clicked.connect(self._on_clear)
         self._open_btn.clicked.connect(self._on_open_downloads)
         self._settings_btn.clicked.connect(self._on_settings)
 
-        self._set_running_state(False)
+        self._refresh_running_state()
 
     def _wire_signals(self) -> None:
         s = self._signals
@@ -156,9 +163,10 @@ class MainWindow(QMainWindow):
         self._append_log(msg)
 
     def _on_start(self) -> None:
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.resume()
-            self._set_running_state(True)
+        if self._workers:
+            for w in self._workers:
+                w.resume()
+            self._refresh_running_state()
             self._append_log("resumed")
             return
         if not any(j.status == JobStatus.PENDING for j in self._jobs):
@@ -166,20 +174,48 @@ class MainWindow(QMainWindow):
                 self, "Nothing to do", "Queue is empty or has no pending items."
             )
             return
-        self._worker = DownloadWorker(self._signals, self._jobs, self._settings)
-        self._worker.start()
-        self._set_running_state(True)
-        self._append_log("worker started")
+        self._spawn_worker()
+
+    def _on_spawn(self) -> None:
+        if len(self._workers) >= MAX_WORKERS:
+            return
+        if not any(j.status == JobStatus.PENDING for j in self._jobs):
+            QMessageBox.information(
+                self,
+                "Nothing to do",
+                "No pending jobs left for a new worker to claim.",
+            )
+            return
+        self._spawn_worker()
+
+    def _spawn_worker(self) -> None:
+        worker_id = self._next_worker_id
+        self._next_worker_id += 1
+        worker = DownloadWorker(
+            self._signals,
+            self._jobs,
+            self._settings,
+            self._claimer,
+            worker_id=worker_id,
+        )
+        self._workers.append(worker)
+        worker.start()
+        self._append_log(f"worker {worker_id} started")
+        self._refresh_running_state()
 
     def _on_pause(self) -> None:
-        if self._worker:
-            self._worker.pause()
-            self._append_log("paused — will stop after current job")
+        if not self._workers:
+            return
+        for w in self._workers:
+            w.pause()
+        self._append_log("paused — workers will stop after their current jobs")
 
     def _on_cancel(self) -> None:
-        if self._worker:
-            self._worker.cancel_current()
-            self._append_log("cancel requested for current job")
+        if not self._workers:
+            return
+        for w in self._workers:
+            w.cancel_current()
+        self._append_log("cancel requested for in-flight jobs")
 
     def _on_clear(self) -> None:
         self._model.remove_finished()
@@ -246,10 +282,10 @@ class MainWindow(QMainWindow):
     def _on_quota_updated(self, text: str) -> None:
         self._quota_label.setText(text)
 
-    def _on_worker_stopped(self) -> None:
-        self._append_log("worker stopped")
-        self._set_running_state(False)
-        self._worker = None
+    def _on_worker_stopped(self, worker_id: int) -> None:
+        self._append_log(f"worker {worker_id} stopped")
+        self._workers = [w for w in self._workers if w.worker_id != worker_id]
+        self._refresh_running_state()
 
     # ---------- helpers ----------
 
@@ -262,23 +298,33 @@ class MainWindow(QMainWindow):
             f"Mode: {m}  ·  Dir: {self._settings.download_dir}"
         )
 
-    def _set_running_state(self, running: bool) -> None:
+    def _refresh_running_state(self) -> None:
+        running = len(self._workers) > 0
         self._start_btn.setEnabled(not running)
         self._pause_btn.setEnabled(running)
         self._cancel_btn.setEnabled(running)
+        self._spawn_btn.setText(self._spawn_btn_label(len(self._workers)))
+        self._spawn_btn.setEnabled(len(self._workers) < MAX_WORKERS)
+
+    @staticmethod
+    def _spawn_btn_label(count: int) -> str:
+        return f"+ Worker ({count}/{MAX_WORKERS})"
 
     # ---------- close ----------
 
     def closeEvent(self, event):
-        if self._worker is not None and self._worker.isRunning():
+        running = [w for w in self._workers if w.isRunning()]
+        if running:
             ans = QMessageBox.question(
                 self,
-                "Worker running",
-                "A download is in progress. Stop and exit?",
+                "Workers running",
+                f"{len(running)} download worker(s) in progress. Stop and exit?",
             )
             if ans != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            self._worker.request_stop()
-            self._worker.wait(5000)
+            for w in running:
+                w.request_stop()
+            for w in running:
+                w.wait(5000)
         event.accept()
