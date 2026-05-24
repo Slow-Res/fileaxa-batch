@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..core.models import DownloadJob, FileMeta, JobStatus
+from ..core.queue_store import load_queue, save_queue
 from ..core.settings import AppSettings, Mode
 from ..core.urls import parse_file_code
 from ..worker.signals import WorkerSignals
@@ -39,7 +40,8 @@ class MainWindow(QMainWindow):
         self.resize(980, 660)
 
         self._settings = settings
-        self._jobs: List[DownloadJob] = []
+        self._jobs: List[DownloadJob] = load_queue()
+        restored_pending = sum(1 for j in self._jobs if j.status == JobStatus.PENDING)
         self._model = QueueModel(self._jobs)
         self._signals = WorkerSignals()
         self._workers: List[DownloadWorker] = []
@@ -48,6 +50,12 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._wire_signals()
+
+        if self._jobs:
+            self._append_log(
+                f"loaded {len(self._jobs)} job(s) from previous session "
+                f"({restored_pending} pending)"
+            )
 
     # ---------- UI ----------
 
@@ -60,6 +68,7 @@ class MainWindow(QMainWindow):
         bar = QHBoxLayout()
         self._add_btn = QPushButton("Add to queue")
         self._start_btn = QPushButton("Start")
+        self._resume_btn = QPushButton("Resume")
         self._spawn_btn = QPushButton(self._spawn_btn_label(0))
         self._pause_btn = QPushButton("Pause")
         self._cancel_btn = QPushButton("Cancel current")
@@ -69,6 +78,7 @@ class MainWindow(QMainWindow):
         for b in (
             self._add_btn,
             self._start_btn,
+            self._resume_btn,
             self._spawn_btn,
             self._pause_btn,
             self._cancel_btn,
@@ -117,6 +127,7 @@ class MainWindow(QMainWindow):
 
         self._add_btn.clicked.connect(self._on_add)
         self._start_btn.clicked.connect(self._on_start)
+        self._resume_btn.clicked.connect(self._on_start)
         self._spawn_btn.clicked.connect(self._on_spawn)
         self._pause_btn.clicked.connect(self._on_pause)
         self._cancel_btn.clicked.connect(self._on_cancel)
@@ -161,6 +172,9 @@ class MainWindow(QMainWindow):
         if skipped:
             msg += f"; skipped {skipped} invalid"
         self._append_log(msg)
+        if added:
+            self._persist_queue()
+            self._refresh_running_state()
 
     def _on_start(self) -> None:
         if self._workers:
@@ -219,6 +233,8 @@ class MainWindow(QMainWindow):
 
     def _on_clear(self) -> None:
         self._model.remove_finished()
+        self._persist_queue()
+        self._refresh_running_state()
 
     def _on_open_downloads(self) -> None:
         d = self._settings.download_dir
@@ -253,6 +269,7 @@ class MainWindow(QMainWindow):
                 size=size if size >= 0 else None,
             )
             self._model.refresh_row(idx)
+            self._persist_queue()
 
     def _on_status_changed(self, idx: int, status: str) -> None:
         if 0 <= idx < len(self._jobs):
@@ -274,10 +291,12 @@ class MainWindow(QMainWindow):
     def _on_job_completed(self, idx: int, path: str) -> None:
         self._model.refresh_row(idx)
         self._append_log(f"✓ {path}")
+        self._persist_queue()
 
     def _on_job_failed(self, idx: int, err: str) -> None:
         self._model.refresh_row(idx)
         self._append_log(f"✗ row {idx + 1}: {err}")
+        self._persist_queue()
 
     def _on_quota_updated(self, text: str) -> None:
         self._quota_label.setText(text)
@@ -300,15 +319,25 @@ class MainWindow(QMainWindow):
 
     def _refresh_running_state(self) -> None:
         running = len(self._workers) > 0
-        self._start_btn.setEnabled(not running)
+        has_pending = any(j.status == JobStatus.PENDING for j in self._jobs)
+        self._start_btn.setEnabled(not running and has_pending)
+        self._resume_btn.setEnabled(not running and has_pending)
         self._pause_btn.setEnabled(running)
         self._cancel_btn.setEnabled(running)
         self._spawn_btn.setText(self._spawn_btn_label(len(self._workers)))
-        self._spawn_btn.setEnabled(len(self._workers) < MAX_WORKERS)
+        self._spawn_btn.setEnabled(
+            len(self._workers) < MAX_WORKERS and has_pending
+        )
 
     @staticmethod
     def _spawn_btn_label(count: int) -> str:
         return f"+ Worker ({count}/{MAX_WORKERS})"
+
+    def _persist_queue(self) -> None:
+        try:
+            save_queue(self._jobs)
+        except OSError as e:
+            self._append_log(f"queue save failed: {e}")
 
     # ---------- close ----------
 
