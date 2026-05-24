@@ -284,9 +284,15 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(status, 0)
 
-    def _on_progress(self, idx: int, done: int, total: int) -> None:
+    def _on_progress(
+        self, idx: int, done: int, total: int, speed: float, eta: float
+    ) -> None:
         if 0 <= idx < len(self._jobs):
-            self._jobs[idx].bytes_done = done
+            job = self._jobs[idx]
+            job.bytes_done = done
+            job.total_bytes = total if total > 0 else 0
+            job.speed_bps = speed
+            job.eta_s = eta
             self._model.refresh_row(idx)
 
     def _on_job_completed(self, idx: int, path: str) -> None:

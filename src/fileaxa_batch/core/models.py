@@ -33,4 +33,7 @@ class DownloadJob:
     meta: Optional[FileMeta] = None
     dest_path: Optional[Path] = None
     bytes_done: int = 0
+    total_bytes: int = 0
+    speed_bps: float = 0.0
+    eta_s: float = 0.0
     error: Optional[str] = None

@@ -1,10 +1,12 @@
 """Per-job Playwright flow. Pure functions over a Playwright Page; no Qt here."""
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
+import httpx
 from playwright.sync_api import Download, Page, TimeoutError as PWTimeout
 
 
@@ -83,6 +85,74 @@ def _unique_path(target: Path) -> Path:
         i += 1
 
 
+def _probe_total_size(page: Page, download_url: str) -> Optional[int]:
+    """Issue a HEAD against the CDN URL to learn the file size before save_as
+    starts. We replay the browser's cookies so the CDN treats it as the same
+    session — otherwise Fileaxa would 403. Best-effort: any failure returns
+    None and the progress UI falls back to 'speed only, no ETA'."""
+    try:
+        cookies = {
+            c["name"]: c["value"] for c in page.context.cookies(download_url)
+        }
+        with httpx.Client(timeout=5.0, follow_redirects=True) as client:
+            resp = client.head(download_url, cookies=cookies)
+            cl = resp.headers.get("content-length")
+            if cl and cl.isdigit():
+                return int(cl)
+    except (httpx.HTTPError, OSError, ValueError):
+        pass
+    return None
+
+
+def _save_with_progress(
+    download: Download,
+    target: Path,
+    total: Optional[int],
+    cancel_check: Callable[[], bool],
+    on_progress: Callable[[int, int, float, float], None],
+    poll_interval: float = 0.5,
+) -> None:
+    """Run download.save_as in a thread so we can poll target's growing size
+    and report speed + ETA. Chromium is already writing the bytes; we just
+    watch the file grow."""
+    err: list[BaseException] = []
+
+    def _saver() -> None:
+        try:
+            download.save_as(target)
+        except BaseException as e:  # noqa: BLE001
+            err.append(e)
+
+    t = threading.Thread(target=_saver, daemon=True)
+    t.start()
+
+    last_size = 0
+    last_t = time.monotonic()
+    while t.is_alive():
+        time.sleep(poll_interval)
+        try:
+            now_size = target.stat().st_size
+        except OSError:
+            now_size = last_size  # file not created yet
+        now_t = time.monotonic()
+        dt = now_t - last_t
+        speed = (now_size - last_size) / dt if dt > 0 else 0.0
+        eta = (total - now_size) / speed if (total and speed > 0) else 0.0
+        on_progress(now_size, total or -1, speed, eta)
+        last_size = now_size
+        last_t = now_t
+        if cancel_check():
+            try:
+                download.cancel()
+            except Exception:
+                pass
+            break
+
+    t.join(timeout=2.0)
+    if err:
+        raise err[0]
+
+
 def download_one(
     page: Page,
     url: str,
@@ -91,7 +161,8 @@ def download_one(
     captcha_timeout_seconds: int,
     cancel_check: Callable[[], bool],
     on_status: Callable[[str], None],
-    on_progress: Callable[[int, int], None],
+    on_progress: Callable[[int, int, float, float], None],
+    on_metadata: Optional[Callable[[str, Optional[int]], None]] = None,
 ) -> Path:
     """Drive one Fileaxa free-tier download. Returns the saved path.
 
@@ -179,13 +250,27 @@ def download_one(
     suggested = download.suggested_filename or f"fileaxa-{int(time.time())}.bin"
     target = _unique_path(dest_dir / suggested)
 
-    on_status("saving file")
-    download.save_as(target)
+    total = _probe_total_size(page, download.url)
 
+    # Emit name + (possibly) total size before bytes start flowing so the table
+    # populates immediately, even in headless mode where there's no Chromium UI.
+    if on_metadata is not None:
+        on_metadata(target.name, total)
+
+    on_status("saving file")
+    _save_with_progress(download, target, total, cancel_check, on_progress)
+
+    if cancel_check():
+        raise CancelledError()
+
+    final: Optional[int] = None
     try:
-        size = target.stat().st_size
-        on_progress(size, size)
+        final = target.stat().st_size
+        on_progress(final, final, 0.0, 0.0)
     except OSError:
         pass
+
+    if on_metadata is not None:
+        on_metadata(target.name, final)
 
     return target

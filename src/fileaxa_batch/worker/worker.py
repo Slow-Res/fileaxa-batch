@@ -197,8 +197,11 @@ class DownloadWorker(QThread):
                 captcha_timeout_seconds=self.settings.captcha_timeout_seconds,
                 cancel_check=self._cancel_current.is_set,
                 on_status=lambda s, _idx=idx, _job=job: self._on_status(_idx, _job, s),
-                on_progress=lambda done, total, _idx=idx, _job=job: self._on_progress(
-                    _idx, _job, done, total
+                on_progress=lambda done, total, spd, eta, _idx=idx, _job=job: self._on_progress(
+                    _idx, _job, done, total, spd, eta
+                ),
+                on_metadata=lambda name, size, _idx=idx: self.signals.metadata_ready.emit(
+                    _idx, name or "", size if size is not None else -1
                 ),
             )
             job.dest_path = path
@@ -220,6 +223,17 @@ class DownloadWorker(QThread):
         job.status = _status_to_enum(s)
         self.signals.status_changed.emit(idx, s)
 
-    def _on_progress(self, idx: int, job: DownloadJob, done: int, total: int) -> None:
+    def _on_progress(
+        self,
+        idx: int,
+        job: DownloadJob,
+        done: int,
+        total: int,
+        speed: float,
+        eta: float,
+    ) -> None:
         job.bytes_done = done
-        self.signals.progress.emit(idx, done, total)
+        job.total_bytes = total if total > 0 else 0
+        job.speed_bps = speed
+        job.eta_s = eta
+        self.signals.progress.emit(idx, done, total, speed, eta)

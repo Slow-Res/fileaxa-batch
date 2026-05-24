@@ -12,7 +12,7 @@ class WorkerSignals(QObject):
     job_started = pyqtSignal(int)               # row index
     metadata_ready = pyqtSignal(int, str, int)  # row index, filename ("" if unknown), size (-1 if unknown)
     status_changed = pyqtSignal(int, str)       # row index, display status string
-    progress = pyqtSignal(int, int, int)        # row index, bytes_done, bytes_total (-1 if unknown)
+    progress = pyqtSignal(int, int, int, float, float)  # row, bytes_done, bytes_total (-1 if unknown), speed_bps, eta_s
     job_completed = pyqtSignal(int, str)        # row index, dest path
     job_failed = pyqtSignal(int, str)           # row index, error message
 
