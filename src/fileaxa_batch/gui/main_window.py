@@ -102,8 +102,9 @@ class MainWindow(QMainWindow):
         self._table.setAlternatingRowColors(True)
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(QueueModel.COL_URL, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(QueueModel.COL_URL, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(QueueModel.COL_NAME, QHeaderView.ResizeMode.Stretch)
+        self._table.setColumnWidth(QueueModel.COL_URL, 220)
         split.addWidget(self._table)
 
         self._log = QPlainTextEdit()
