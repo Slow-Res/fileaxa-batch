@@ -29,6 +29,7 @@ from ..core.settings import AppSettings, Mode
 from ..core.urls import parse_file_code
 from ..worker.signals import WorkerSignals
 from ..worker.worker import DownloadWorker, JobClaimer
+from .sidebar import StatusFilterProxy, StatusSidebar
 from .queue_model import QueueModel
 from .settings_dialog import SettingsDialog
 from .widgets import UrlInput
@@ -95,8 +96,23 @@ class MainWindow(QMainWindow):
         self._url_input = UrlInput()
         split.addWidget(self._url_input)
 
+        # Sidebar (left) + table (right), horizontally split. The proxy
+        # model in between filters by the sidebar's selected status; the
+        # underlying QueueModel still holds every job.
+        self._sidebar = StatusSidebar()
+        self._proxy = StatusFilterProxy()
+        self._proxy.setSourceModel(self._model)
+        self._sidebar.statusSelected.connect(self._proxy.set_status_filter)
+        # Recompute the sidebar's per-status counts whenever the underlying
+        # model changes — rows added, removed, or status-touched via
+        # refresh_row(). All three signals route through the source model.
+        self._model.dataChanged.connect(self._refresh_sidebar_counts)
+        self._model.rowsInserted.connect(self._refresh_sidebar_counts)
+        self._model.rowsRemoved.connect(self._refresh_sidebar_counts)
+        self._sidebar.update_counts(self._jobs)
+
         self._table = QTableView()
-        self._table.setModel(self._model)
+        self._table.setModel(self._proxy)
         self._table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self._table.setAlternatingRowColors(True)
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -106,7 +122,14 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(QueueModel.COL_URL, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(QueueModel.COL_NAME, QHeaderView.ResizeMode.Stretch)
         self._table.setColumnWidth(QueueModel.COL_URL, 220)
-        split.addWidget(self._table)
+
+        table_split = QSplitter(Qt.Orientation.Horizontal)
+        table_split.addWidget(self._sidebar)
+        table_split.addWidget(self._table)
+        table_split.setStretchFactor(0, 0)
+        table_split.setStretchFactor(1, 1)
+        table_split.setSizes([170, 800])
+        split.addWidget(table_split)
 
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
@@ -395,13 +418,15 @@ class MainWindow(QMainWindow):
         menu.exec(self._table.viewport().mapToGlobal(pos))
 
     def _selected_rows_with_status(self, *allowed: JobStatus) -> List[int]:
+        # selectedRows() returns proxy indices when a filter is active; map
+        # back to the source model so we operate on the real self._jobs list.
         sel = self._table.selectionModel().selectedRows()
-        return [
-            idx.row()
-            for idx in sel
-            if 0 <= idx.row() < len(self._jobs)
-            and self._jobs[idx.row()].status in allowed
-        ]
+        out: List[int] = []
+        for proxy_idx in sel:
+            src_row = self._proxy.mapToSource(proxy_idx).row()
+            if 0 <= src_row < len(self._jobs) and self._jobs[src_row].status in allowed:
+                out.append(src_row)
+        return out
 
     def _start_rows(self, rows: List[int]) -> None:
         """Make these rows happen now: flip non-PENDING rows to PENDING, then
@@ -561,8 +586,10 @@ class MainWindow(QMainWindow):
 
     def _on_job_started(self, idx: int) -> None:
         self._model.refresh_row(idx)
-        self._table.selectRow(idx)
-        self._table.scrollTo(self._model.index(idx, 0))
+        proxy_idx = self._proxy.mapFromSource(self._model.index(idx, 0))
+        if proxy_idx.isValid():
+            self._table.selectRow(proxy_idx.row())
+            self._table.scrollTo(proxy_idx)
 
     def _on_metadata_ready(self, idx: int, name: str, size: int) -> None:
         if 0 <= idx < len(self._jobs):
@@ -648,10 +675,14 @@ class MainWindow(QMainWindow):
         self._spawn_btn.setEnabled(
             len(self._workers) < MAX_WORKERS and has_actionable
         )
+        self._sidebar.update_counts(self._jobs)
 
     @staticmethod
     def _spawn_btn_label(count: int) -> str:
         return f"+ Worker ({count}/{MAX_WORKERS})"
+
+    def _refresh_sidebar_counts(self, *_args) -> None:
+        self._sidebar.update_counts(self._jobs)
 
     def _persist_queue(self) -> None:
         try:
