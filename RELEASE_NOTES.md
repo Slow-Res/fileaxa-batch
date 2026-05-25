@@ -7,9 +7,8 @@ click Start and the download Range-requests its way to completion
 from exactly where it stopped.
 
 Plus a left-rail status sidebar, a real httpx download transport
-with full browser-header replay, an experimental psdly resolver, and
-a fix for the disk-dedup bug that was masquerading partial files as
-"completed."
+with full browser-header replay, and a fix for the disk-dedup bug
+that was masquerading partial files as "completed."
 
 ## Highlights
 
@@ -42,9 +41,6 @@ a fix for the disk-dedup bug that was masquerading partial files as
 - **Right-click row actions** now include Start, Retry, Resume,
   Override, Cancel — multi-selection aware, all show live counts in
   the menu labels.
-- **Experimental psdly.co.uk redirector.** Accept
-  `https://www.psdly.co.uk/go/<token>` URLs; the worker waits up to
-  60s for the page to redirect to fileaxa before continuing.
 
 ## Behavior changes
 
@@ -83,10 +79,6 @@ Start to re-process them.
   exist — pause takes effect after the current `save_as` call
   returns, which is whenever the OS finishes the temp-to-target
   copy.
-- The psdly resolver assumes a JS `window.location` redirect within
-  60 seconds. If psdly changes their flow, the worker raises
-  `TimeoutError`; the row goes FAILED and can be Retried after the
-  resolver code is updated.
 - Headless Playwright mode still fails on Fileaxa CAPTCHA pages —
   you need the visible Chromium to solve them.
 
