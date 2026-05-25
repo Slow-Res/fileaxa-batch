@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Launch fileaxa-batch using the project's local .venv.
+#
+# Works from anywhere (symlink to it, add to PATH, double-click, etc.) —
+# resolves the project root relative to the script's own location, not
+# the caller's working directory. Forwards all CLI args to the app.
+set -e
+
+# Resolve symlinks so `ln -s` into ~/.local/bin still finds the project.
+SOURCE=${BASH_SOURCE[0]}
+while [[ -L "$SOURCE" ]]; do
+    SOURCE_DIR=$(cd -P "$(dirname "$SOURCE")" >/dev/null && pwd)
+    SOURCE=$(readlink "$SOURCE")
+    [[ "$SOURCE" != /* ]] && SOURCE="$SOURCE_DIR/$SOURCE"
+done
+SCRIPT_DIR=$(cd -P "$(dirname "$SOURCE")" >/dev/null && pwd)
+PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+
+VENV_PY="$PROJECT_ROOT/.venv/bin/python"
+
+if [[ ! -x "$VENV_PY" ]]; then
+    cat >&2 <<EOF
+fileaxa-batch: no virtualenv at $PROJECT_ROOT/.venv
+
+First-time setup:
+  cd "$PROJECT_ROOT"
+  python3 -m venv .venv
+  .venv/bin/pip install -e .
+  .venv/bin/playwright install chromium
+EOF
+    exit 1
+fi
+
+exec "$VENV_PY" -m fileaxa_batch "$@"
