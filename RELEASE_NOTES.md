@@ -1,3 +1,97 @@
+# fileaxa-batch v0.4.0
+
+Major UX release. The headline is **browser-style pause/resume** —
+mid-download, you can hit Pause, the worker exits cleanly, and the
+partial file sits on disk. Hours later (or after a full app restart),
+click Start and the download Range-requests its way to completion
+from exactly where it stopped.
+
+Plus a left-rail status sidebar, a real httpx download transport
+with full browser-header replay, an experimental psdly resolver, and
+a fix for the disk-dedup bug that was masquerading partial files as
+"completed."
+
+## Highlights
+
+- **Pause / Resume that actually pauses.** New `JobStatus.PAUSED`
+  preserves the partial file on disk and persists across restarts.
+  Pause exits the worker thread cleanly (frees Chromium + Playwright).
+  Resume spawns a fresh worker that re-runs the Playwright flow to
+  capture a new CDN URL, then `Range:`-requests the remaining bytes
+  using the on-disk offset.
+- **httpx download transport with full browser-header replay.** New
+  Settings → Download transport: Playwright (no Speed/ETA, save_as)
+  or httpx (real Speed/ETA, copies the exact request headers
+  Chromium sent — including HTTP/2 pseudo-header stripping). Logs
+  every request/response to `~/.config/fileaxa-batch/httpx.log` for
+  post-mortem inspection.
+- **Status sidebar.** Left-rail QListWidget grouping rows by status
+  with live counts. Click "Paused" to see only paused; click
+  "Failed" to see only failures. Multi-selection across the filtered
+  view still operates on the underlying jobs correctly via
+  mapToSource translation.
+- **Size-aware disk dedup.** v0.3.x would mark a row COMPLETED if
+  the destination filename matched anything on disk — even a
+  partial file from a cancelled attempt. Now compares file size to
+  the CDN's Content-Length (via HEAD probe) or the API metadata
+  size; mismatches trigger Range resume (HTTPX) or fresh download
+  with cleanup (Playwright).
+- **`bytes_done` is persisted.** New SQLite column with an
+  idempotent ALTER TABLE migration for existing v0.3.x databases —
+  no manual step.
+- **Right-click row actions** now include Start, Retry, Resume,
+  Override, Cancel — multi-selection aware, all show live counts in
+  the menu labels.
+- **Experimental psdly.co.uk redirector.** Accept
+  `https://www.psdly.co.uk/go/<token>` URLs; the worker waits up to
+  60s for the page to redirect to fileaxa before continuing.
+
+## Behavior changes
+
+- **Pause is now a clean worker shutdown.** Previously Pause only
+  stopped claiming new jobs; the current download ran to completion.
+  Now Pause aborts the chunk loop AND exits the worker thread.
+  Resume spawns a fresh worker.
+- **Closing the window with workers running prompts "Pause and
+  exit"** (was "Stop and exit"). In-flight rows are saved as PAUSED
+  with their partial files preserved, instead of being lost.
+- **`Clear completed`** (renamed from `Clear finished` in v0.3.0)
+  now sweeps only COMPLETED. FAILED, CANCELLED, and PAUSED stay
+  put — they're recoverable via Retry / Resume.
+
+## Upgrade
+
+From a checkout:
+```bash
+cd ~/fileaxa-batch && bin/update
+```
+
+Fresh install:
+```bash
+curl -fsSL https://raw.githubusercontent.com/Slow-Res/fileaxa-batch/main/bin/install | bash
+```
+
+Your `queue.db` is forward-compatible — the `bytes_done` column is
+added in-place on first connect. Any rows stuck in DOWNLOADING /
+NAVIGATING / etc. from a v0.3.x crash will load as PENDING; click
+Start to re-process them.
+
+## Known limitations
+
+- Pause's mid-bytes responsiveness applies only to the httpx
+  transport. In Playwright save_as mode, the chunk loop doesn't
+  exist — pause takes effect after the current `save_as` call
+  returns, which is whenever the OS finishes the temp-to-target
+  copy.
+- The psdly resolver assumes a JS `window.location` redirect within
+  60 seconds. If psdly changes their flow, the worker raises
+  `TimeoutError`; the row goes FAILED and can be Retried after the
+  resolver code is updated.
+- Headless Playwright mode still fails on Fileaxa CAPTCHA pages —
+  you need the visible Chromium to solve them.
+
+---
+
 # fileaxa-batch v0.3.0
 
 **If you're on v0.2.0, upgrade.** v0.2.0 ships a streaming-progress
