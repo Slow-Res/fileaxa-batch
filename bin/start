@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Friendlier alias for bin/fileaxa-batch. Forwards all CLI args.
+exec "$(dirname "${BASH_SOURCE[0]}")/fileaxa-batch" "$@"
