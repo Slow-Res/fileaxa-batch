@@ -43,10 +43,15 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("fileaxa-batch")
     app.setOrganizationName("fileaxa-batch")
-    app.setWindowIcon(_load_app_icon())
+    icon = _load_app_icon()
+    app.setWindowIcon(icon)
     settings = AppSettings.load()
     settings.download_dir.mkdir(parents=True, exist_ok=True)
     window = MainWindow(settings)
+    # Set on the window too — QApplication.setWindowIcon alone is unreliable
+    # under gnome-shell; the title bar / alt-tab / taskbar pick up the
+    # per-window icon more consistently.
+    window.setWindowIcon(icon)
     window.show()
     return app.exec()
 

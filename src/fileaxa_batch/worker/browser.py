@@ -246,20 +246,24 @@ def download_one(
     existing = dest_dir / suggested
 
     # Disk-side dedup: if a file with the suggested name is already in the
-    # download directory we don't re-write it. Chromium has done the network
-    # work already; we just discard its temp file via download.delete().
+    # download directory we abort Chromium's in-flight transfer and return
+    # the existing path. download.cancel() (NOT download.delete() — that
+    # blocks until the transfer finishes, defeating the whole point) tells
+    # the browser to stop mid-bytes.
     if existing.exists():
         on_status("already on disk; skipping save")
+        # Emit metadata first so the table populates even if cancel() lags.
         try:
-            download.delete()
+            existing_size = existing.stat().st_size
+        except OSError:
+            existing_size = 0
+        if on_metadata is not None:
+            on_metadata(existing.name, existing_size or None)
+        on_progress(existing_size, existing_size, 0.0, 0.0)
+        try:
+            download.cancel()
         except Exception:
             pass
-        if on_metadata is not None:
-            try:
-                on_metadata(existing.name, existing.stat().st_size)
-            except OSError:
-                on_metadata(existing.name, None)
-        on_progress(existing.stat().st_size, existing.stat().st_size, 0.0, 0.0)
         return existing
 
     target = _unique_path(dest_dir / suggested)
