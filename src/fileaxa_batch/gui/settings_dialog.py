@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..core.settings import AppSettings, Mode
+from ..core.settings import AppSettings, DownloadMode, Mode
 from ..secrets import clear_api_key, get_api_key, set_api_key
 
 
@@ -83,6 +83,18 @@ class SettingsDialog(QDialog):
         self._headless.setChecked(settings.headless)
         form.addRow("Headless mode:", self._headless)
 
+        self._download_mode = QComboBox()
+        self._download_mode.addItem(
+            "Playwright (no Speed/ETA)", DownloadMode.PLAYWRIGHT
+        )
+        self._download_mode.addItem(
+            "httpx (real Speed/ETA, copies browser headers)", DownloadMode.HTTPX
+        )
+        self._download_mode.setCurrentIndex(
+            1 if settings.download_mode == DownloadMode.HTTPX else 0
+        )
+        form.addRow("Download transport:", self._download_mode)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -113,6 +125,7 @@ class SettingsDialog(QDialog):
         self._settings.free_timer_seconds = self._timer.value()
         self._settings.captcha_timeout_seconds = self._captcha.value()
         self._settings.headless = self._headless.isChecked()
+        self._settings.download_mode = self._download_mode.currentData()
         self._settings.save()
         new_key = self._key_edit.text().strip()
         if new_key:

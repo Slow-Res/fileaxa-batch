@@ -12,6 +12,24 @@ class Mode(str, Enum):
     API = "api"
 
 
+class DownloadMode(str, Enum):
+    """How the actual file bytes get to disk after the CAPTCHA flow.
+
+    PLAYWRIGHT: download.save_as() — what Chromium has been doing forever.
+        Battle-tested, exactly matches what the browser would do. Downside:
+        Playwright doesn't surface byte-level progress so Speed/ETA columns
+        stay empty during transfer.
+
+    HTTPX: after capturing the download URL we cancel Playwright's transfer
+        and re-fetch with httpx, copying the browser's request headers and
+        cookies. Real per-chunk progress. Downside: CDN may reject the
+        non-Chromium request if a header is missing or wrong; failures are
+        loud rather than silently falling back.
+    """
+    PLAYWRIGHT = "playwright"
+    HTTPX = "httpx"
+
+
 def config_dir() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     return Path(base) / "fileaxa-batch"
@@ -32,6 +50,7 @@ class AppSettings:
     free_timer_seconds: int = 25
     captcha_timeout_seconds: int = 120
     headless: bool = False
+    download_mode: DownloadMode = DownloadMode.PLAYWRIGHT
 
     @classmethod
     def load(cls) -> "AppSettings":
@@ -48,6 +67,9 @@ class AppSettings:
             free_timer_seconds=int(data.get("free_timer_seconds", 70)),
             captcha_timeout_seconds=int(data.get("captcha_timeout_seconds", 600)),
             headless=bool(data.get("headless", False)),
+            download_mode=DownloadMode(
+                data.get("download_mode", DownloadMode.PLAYWRIGHT.value)
+            ),
         )
 
     def save(self) -> None:
@@ -59,5 +81,6 @@ class AppSettings:
             "free_timer_seconds": self.free_timer_seconds,
             "captcha_timeout_seconds": self.captcha_timeout_seconds,
             "headless": self.headless,
+            "download_mode": self.download_mode.value,
         }
         path.write_text(json.dumps(data, indent=2))

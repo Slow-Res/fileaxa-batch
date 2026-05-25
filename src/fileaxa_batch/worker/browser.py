@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import httpx
-from playwright.sync_api import Download, Page, TimeoutError as PWTimeout
+from playwright.sync_api import Download, Page, Request, TimeoutError as PWTimeout
+
+from ..core.settings import DownloadMode
 
 
 # Fileaxa free-tier flow uses an HTML form posted back to the same URL.
@@ -148,6 +150,57 @@ def _save_with_progress(
         poller.join(timeout=2.0)
 
 
+def _httpx_download(
+    target: Path,
+    download_url: str,
+    headers: dict,
+    cookies: dict,
+    total: Optional[int],
+    cancel_check: Callable[[], bool],
+    on_progress: Callable[[int, int, float, float], None],
+) -> int:
+    """Stream the file via httpx with the browser's headers + cookies copied
+    over. Returns the final byte count. Bypasses Playwright entirely for the
+    bytes, which is the only way to surface real-time progress."""
+    timeout = httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=60.0)
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        with client.stream(
+            "GET", download_url, headers=headers, cookies=cookies
+        ) as resp:
+            resp.raise_for_status()
+            cl = resp.headers.get("content-length")
+            actual_total = total or (int(cl) if cl and cl.isdigit() else None)
+
+            done = 0
+            last_emit_t = time.monotonic()
+            last_emit_done = 0
+
+            with target.open("wb") as f:
+                for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+                    if cancel_check():
+                        try:
+                            target.unlink()
+                        except OSError:
+                            pass
+                        raise CancelledError()
+                    f.write(chunk)
+                    done += len(chunk)
+                    now = time.monotonic()
+                    if now - last_emit_t >= 0.5:
+                        dt = now - last_emit_t
+                        speed = (done - last_emit_done) / dt
+                        eta = (
+                            (actual_total - done) / speed
+                            if (actual_total and speed > 0)
+                            else 0.0
+                        )
+                        on_progress(done, actual_total or -1, speed, eta)
+                        last_emit_t = now
+                        last_emit_done = done
+            on_progress(done, done, 0.0, 0.0)
+            return done
+
+
 def download_one(
     page: Page,
     url: str,
@@ -158,6 +211,8 @@ def download_one(
     on_status: Callable[[str], None],
     on_progress: Callable[[int, int, float, float], None],
     on_metadata: Optional[Callable[[str, Optional[int]], None]] = None,
+    download_mode: DownloadMode = DownloadMode.PLAYWRIGHT,
+    on_log: Optional[Callable[[str], None]] = None,
 ) -> Path:
     """Drive one Fileaxa free-tier download. Returns the saved path.
 
@@ -210,6 +265,19 @@ def download_one(
         lambda remaining: on_status(f"timer {remaining}s"),
     )
 
+    # If we're in HTTPX mode, stash every outgoing request during the click
+    # so we can later find the one matching download.url and replay its
+    # headers exactly. Setting this up before the click captures the
+    # redirect chain and the final CDN request.
+    captured_requests: list[Request] = []
+    request_listener = None
+    if download_mode == DownloadMode.HTTPX:
+        def _on_request(req: Request) -> None:
+            if req.method == "GET":
+                captured_requests.append(req)
+        request_listener = _on_request
+        page.on("request", request_listener)
+
     on_status("clicking create-download-link")
     try:
         with page.expect_download(timeout=captcha_timeout_seconds * 1000) as dl_info:
@@ -230,10 +298,21 @@ def download_one(
                     )
         download: Download = dl_info.value
     except PWTimeout:
+        if request_listener is not None:
+            page.remove_listener("request", request_listener)
         raise TimeoutError(
             f"no download started within {captcha_timeout_seconds}s "
             "(may indicate CAPTCHA, page change, or rate-limit)"
         )
+    finally:
+        if request_listener is not None:
+            # Detach listener now that we have what we need. We'll still read
+            # captured_requests after this block — Python closures keep them
+            # alive even after the listener is removed.
+            try:
+                page.remove_listener("request", request_listener)
+            except Exception:
+                pass
 
     if cancel_check():
         try:
@@ -276,7 +355,66 @@ def download_one(
         on_metadata(target.name, total)
 
     on_status("saving file")
-    _save_with_progress(download, target, total, cancel_check, on_progress)
+    if download_mode == DownloadMode.HTTPX:
+        # Find the captured GET that matches the download URL and replay
+        # its headers + the matching cookies via httpx. If no match (race
+        # or filter miss), fall back to save_as rather than failing — the
+        # only cost is losing Speed/ETA on that one row.
+        matching = next(
+            (r for r in captured_requests if r.url == download.url),
+            None,
+        )
+        if matching is None:
+            if on_log:
+                on_log(
+                    "httpx: no captured request matched download.url; "
+                    "falling back to Playwright save_as for this row"
+                )
+            _save_with_progress(download, target, total, cancel_check, on_progress)
+        else:
+            try:
+                headers = matching.all_headers()
+            except Exception:
+                headers = dict(matching.headers)
+            # httpx manages Host / Connection / Content-Length itself.
+            for h in ("host", "connection", "content-length"):
+                headers.pop(h, None)
+            cookies = {
+                c["name"]: c["value"]
+                for c in page.context.cookies(download.url)
+            }
+            if on_log:
+                on_log(
+                    f"httpx GET {download.url} "
+                    f"headers={sorted(headers.keys())} "
+                    f"cookies={sorted(cookies.keys())}"
+                )
+            try:
+                download.cancel()  # stop Playwright's duplicate transfer
+            except Exception:
+                pass
+            try:
+                _httpx_download(
+                    target,
+                    download.url,
+                    headers,
+                    cookies,
+                    total,
+                    cancel_check,
+                    on_progress,
+                )
+            except httpx.HTTPStatusError as e:
+                raise RuntimeError(
+                    f"httpx download rejected by CDN "
+                    f"({e.response.status_code}); the captured headers "
+                    "may not match what Chromium actually sent"
+                ) from e
+            except httpx.HTTPError as e:
+                raise RuntimeError(
+                    f"httpx download failed: {type(e).__name__}: {e}"
+                ) from e
+    else:
+        _save_with_progress(download, target, total, cancel_check, on_progress)
 
     if cancel_check():
         raise CancelledError()

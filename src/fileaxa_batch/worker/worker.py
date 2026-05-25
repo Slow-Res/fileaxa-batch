@@ -217,6 +217,8 @@ class DownloadWorker(QThread):
                 on_metadata=lambda name, size, _idx=idx: self.signals.metadata_ready.emit(
                     _idx, name or "", size if size is not None else -1
                 ),
+                download_mode=self.settings.download_mode,
+                on_log=self.signals.worker_log.emit,
             )
             job.dest_path = path
             job.status = JobStatus.COMPLETED

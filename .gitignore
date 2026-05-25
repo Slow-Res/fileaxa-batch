@@ -25,6 +25,7 @@ cookies.json
 .idea/
 .claude/
 .remember/
+.playwright-mcp/
 
 # Ad-hoc recon / e2e scripts
 _recon*.py
