@@ -267,25 +267,39 @@ class MainWindow(QMainWindow):
     def _on_row_context_menu(self, pos) -> None:
         """Right-click menu on the queue table.
 
-        - Retry for FAILED / CANCELLED rows (existing behavior)
-        - Retry / Override / Cancel for APPROVAL rows (duplicate-URL flow)
+        - Start  for PENDING / FAILED / CANCELLED / APPROVAL — flip to
+                 PENDING (if needed) AND spawn a worker if none are running
+        - Retry  for FAILED / CANCELLED / APPROVAL — flip to PENDING only
+        - Override for APPROVAL — supersede the original, flip to PENDING
+        - Cancel for APPROVAL — drop this row from the queue
         """
+        startable_rows = self._selected_rows_with_status(
+            JobStatus.PENDING,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+            JobStatus.APPROVAL,
+        )
         retryable_rows = self._selected_rows_with_status(
-            JobStatus.FAILED, JobStatus.CANCELLED
+            JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.APPROVAL
         )
         approval_rows = self._selected_rows_with_status(JobStatus.APPROVAL)
 
         menu = QMenu(self._table)
 
-        # Retry: applies to FAILED/CANCELLED *and* APPROVAL (in APPROVAL the
-        # original stays in the queue; the new row just flips to PENDING).
-        retry_targets = retryable_rows + approval_rows
-        retry_action = QAction(
-            f"Retry ({len(retry_targets)})" if retry_targets else "Retry",
+        start_action = QAction(
+            f"Start ({len(startable_rows)})" if startable_rows else "Start",
             self._table,
         )
-        retry_action.setEnabled(bool(retry_targets))
-        retry_action.triggered.connect(lambda: self._retry_rows(retry_targets))
+        start_action.setEnabled(bool(startable_rows))
+        start_action.triggered.connect(lambda: self._start_rows(startable_rows))
+        menu.addAction(start_action)
+
+        retry_action = QAction(
+            f"Retry ({len(retryable_rows)})" if retryable_rows else "Retry",
+            self._table,
+        )
+        retry_action.setEnabled(bool(retryable_rows))
+        retry_action.triggered.connect(lambda: self._retry_rows(retryable_rows))
         menu.addAction(retry_action)
 
         # Override / Cancel only make sense on APPROVAL rows.
@@ -319,6 +333,28 @@ class MainWindow(QMainWindow):
             if 0 <= idx.row() < len(self._jobs)
             and self._jobs[idx.row()].status in allowed
         ]
+
+    def _start_rows(self, rows: List[int]) -> None:
+        """Make these rows happen now: flip non-PENDING rows to PENDING, then
+        spawn a worker if none are running (unless we're at MAX_WORKERS, in
+        which case the busy workers will claim these rows when they free up)."""
+        if not rows:
+            return
+        for row in rows:
+            job = self._jobs[row]
+            if job.status != JobStatus.PENDING:
+                job.status = JobStatus.PENDING
+                job.error = None
+                job.bytes_done = 0
+                job.total_bytes = 0
+                job.speed_bps = 0.0
+                job.eta_s = 0.0
+                self._model.refresh_row(row)
+        if not self._workers and len(self._workers) < MAX_WORKERS:
+            self._spawn_worker()
+        self._append_log(f"started {len(rows)} row(s)")
+        self._persist_queue()
+        self._refresh_running_state()
 
     def _retry_rows(self, rows: List[int]) -> None:
         if not rows:
