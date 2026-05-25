@@ -4,7 +4,7 @@ import subprocess
 import sys
 from typing import List
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QModelIndex, Qt
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -74,7 +74,7 @@ class MainWindow(QMainWindow):
         self._spawn_btn = QPushButton(self._spawn_btn_label(0))
         self._pause_btn = QPushButton("Pause")
         self._cancel_btn = QPushButton("Cancel current")
-        self._clear_btn = QPushButton("Clear finished")
+        self._clear_btn = QPushButton("Clear completed")
         self._open_btn = QPushButton("Open downloads")
         self._settings_btn = QPushButton("Settings…")
         for b in (
@@ -161,6 +161,7 @@ class MainWindow(QMainWindow):
         if not text:
             return
         added = 0
+        approval = 0
         skipped = 0
         for line in text.splitlines():
             url = line.strip()
@@ -170,14 +171,34 @@ class MainWindow(QMainWindow):
             if not code:
                 skipped += 1
                 continue
-            self._model.add_job(DownloadJob(url=url, file_code=code))
-            added += 1
+            # Queue-side dedup: if the file_code is already enqueued in any
+            # status, the new row enters as APPROVAL — the user decides
+            # Retry / Override / Cancel via the row context menu.
+            existing = next(
+                (i for i, j in enumerate(self._jobs) if j.file_code == code),
+                None,
+            )
+            if existing is not None:
+                self._model.add_job(
+                    DownloadJob(
+                        url=url,
+                        file_code=code,
+                        status=JobStatus.APPROVAL,
+                        error=f"duplicate of row {existing + 1}",
+                    )
+                )
+                approval += 1
+            else:
+                self._model.add_job(DownloadJob(url=url, file_code=code))
+                added += 1
         self._url_input.clear()
-        msg = f"queued {added} URL(s)"
+        parts = [f"queued {added} URL(s)"]
+        if approval:
+            parts.append(f"{approval} duplicate(s) need approval")
         if skipped:
-            msg += f"; skipped {skipped} invalid"
-        self._append_log(msg)
-        if added:
+            parts.append(f"skipped {skipped} invalid")
+        self._append_log("; ".join(parts))
+        if added or approval:
             self._persist_queue()
             self._refresh_running_state()
 
@@ -237,34 +258,66 @@ class MainWindow(QMainWindow):
         self._append_log("cancel requested for in-flight jobs")
 
     def _on_clear(self) -> None:
-        self._model.remove_finished()
+        self._model.remove_completed()
         self._persist_queue()
         self._refresh_running_state()
 
     # ---------- Row context menu ----------
 
     def _on_row_context_menu(self, pos) -> None:
-        """Right-click on a table row → 'Retry' for any FAILED / CANCELLED rows
-        in the current selection. Idle workers pick them up automatically; if
-        no workers are running, the user still has to hit Start."""
-        rows = self._selected_retryable_rows()
-        menu = QMenu(self._table)
-        retry_action = QAction(
-            f"Retry ({len(rows)})" if rows else "Retry", self._table
+        """Right-click menu on the queue table.
+
+        - Retry for FAILED / CANCELLED rows (existing behavior)
+        - Retry / Override / Cancel for APPROVAL rows (duplicate-URL flow)
+        """
+        retryable_rows = self._selected_rows_with_status(
+            JobStatus.FAILED, JobStatus.CANCELLED
         )
-        retry_action.setEnabled(bool(rows))
-        retry_action.triggered.connect(lambda: self._retry_rows(rows))
+        approval_rows = self._selected_rows_with_status(JobStatus.APPROVAL)
+
+        menu = QMenu(self._table)
+
+        # Retry: applies to FAILED/CANCELLED *and* APPROVAL (in APPROVAL the
+        # original stays in the queue; the new row just flips to PENDING).
+        retry_targets = retryable_rows + approval_rows
+        retry_action = QAction(
+            f"Retry ({len(retry_targets)})" if retry_targets else "Retry",
+            self._table,
+        )
+        retry_action.setEnabled(bool(retry_targets))
+        retry_action.triggered.connect(lambda: self._retry_rows(retry_targets))
         menu.addAction(retry_action)
+
+        # Override / Cancel only make sense on APPROVAL rows.
+        override_action = QAction(
+            f"Override ({len(approval_rows)})" if approval_rows else "Override",
+            self._table,
+        )
+        override_action.setEnabled(bool(approval_rows))
+        override_action.triggered.connect(
+            lambda: self._override_rows(approval_rows)
+        )
+        menu.addAction(override_action)
+
+        cancel_action = QAction(
+            f"Cancel ({len(approval_rows)})" if approval_rows else "Cancel",
+            self._table,
+        )
+        cancel_action.setEnabled(bool(approval_rows))
+        cancel_action.triggered.connect(
+            lambda: self._cancel_approval_rows(approval_rows)
+        )
+        menu.addAction(cancel_action)
+
         menu.exec(self._table.viewport().mapToGlobal(pos))
 
-    def _selected_retryable_rows(self) -> List[int]:
+    def _selected_rows_with_status(self, *allowed: JobStatus) -> List[int]:
         sel = self._table.selectionModel().selectedRows()
-        retryable = (JobStatus.FAILED, JobStatus.CANCELLED)
         return [
             idx.row()
             for idx in sel
             if 0 <= idx.row() < len(self._jobs)
-            and self._jobs[idx.row()].status in retryable
+            and self._jobs[idx.row()].status in allowed
         ]
 
     def _retry_rows(self, rows: List[int]) -> None:
@@ -280,6 +333,59 @@ class MainWindow(QMainWindow):
             job.eta_s = 0.0
             self._model.refresh_row(row)
         self._append_log(f"retry queued for {len(rows)} row(s)")
+        self._persist_queue()
+        self._refresh_running_state()
+
+    def _override_rows(self, rows: List[int]) -> None:
+        """For each APPROVAL row, mark every OTHER row with the same
+        file_code as CANCELLED (superseded), then flip this row to PENDING.
+        Active downloads of the original are left alone — overriding a row
+        that's currently mid-flight only takes effect after that worker
+        finishes; the existing in-flight state is logged."""
+        if not rows:
+            return
+        active = {
+            JobStatus.FETCHING_METADATA,
+            JobStatus.NAVIGATING,
+            JobStatus.WAITING_TIMER,
+            JobStatus.WAITING_CAPTCHA,
+            JobStatus.DOWNLOADING,
+        }
+        overridden = 0
+        for row in rows:
+            job = self._jobs[row]
+            for i, other in enumerate(self._jobs):
+                if i == row or other.file_code != job.file_code:
+                    continue
+                if other.status in active:
+                    self._append_log(
+                        f"row {i + 1} is currently active; "
+                        "override will only apply after it completes"
+                    )
+                    continue
+                other.status = JobStatus.CANCELLED
+                other.error = f"superseded by row {row + 1}"
+                self._model.refresh_row(i)
+            job.status = JobStatus.PENDING
+            job.error = None
+            self._model.refresh_row(row)
+            overridden += 1
+        self._append_log(f"override applied to {overridden} row(s)")
+        self._persist_queue()
+        self._refresh_running_state()
+
+    def _cancel_approval_rows(self, rows: List[int]) -> None:
+        """Drop APPROVAL rows from the queue entirely. Safe across workers
+        because APPROVAL rows are never claimed (JobClaimer only takes
+        PENDING)."""
+        if not rows:
+            return
+        # Remove from end to keep earlier indices stable mid-iteration.
+        for row in sorted(rows, reverse=True):
+            self._model.beginRemoveRows(QModelIndex(), row, row)
+            del self._jobs[row]
+            self._model.endRemoveRows()
+        self._append_log(f"cancelled {len(rows)} approval row(s)")
         self._persist_queue()
         self._refresh_running_state()
 

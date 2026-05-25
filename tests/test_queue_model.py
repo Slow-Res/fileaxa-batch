@@ -29,17 +29,24 @@ def test_add_and_count(qapp):
     assert model.rowCount() == 1
 
 
-def test_remove_finished(qapp):
+def test_remove_completed_keeps_failed_and_cancelled(qapp):
+    """FAILED and CANCELLED are recoverable via Retry — Clear completed
+    must leave them alone."""
     jobs = [
         DownloadJob(url="u1", file_code="c1", status=JobStatus.PENDING),
         DownloadJob(url="u2", file_code="c2", status=JobStatus.COMPLETED),
         DownloadJob(url="u3", file_code="c3", status=JobStatus.FAILED),
-        DownloadJob(url="u4", file_code="c4", status=JobStatus.PENDING),
+        DownloadJob(url="u4", file_code="c4", status=JobStatus.CANCELLED),
+        DownloadJob(url="u5", file_code="c5", status=JobStatus.PENDING),
     ]
     model = QueueModel(jobs)
-    model.remove_finished()
-    assert model.rowCount() == 2
-    assert all(j.status == JobStatus.PENDING for j in jobs)
+    model.remove_completed()
+    # u2 (COMPLETED) is swept; the rest stay.
+    assert model.rowCount() == 4
+    surviving_statuses = {j.status for j in jobs}
+    assert JobStatus.COMPLETED not in surviving_statuses
+    assert JobStatus.FAILED in surviving_statuses
+    assert JobStatus.CANCELLED in surviving_statuses
 
 
 def test_data_returns_filename_when_meta_set(qapp):

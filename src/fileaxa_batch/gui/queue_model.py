@@ -105,12 +105,13 @@ class QueueModel(QAbstractTableModel):
         self.jobs.append(job)
         self.endInsertRows()
 
-    def remove_finished(self) -> None:
-        """Remove completed/cancelled/failed rows. Removes from end so indices
-        stay stable during iteration."""
-        terminal = (JobStatus.COMPLETED, JobStatus.CANCELLED, JobStatus.FAILED)
+    def remove_completed(self) -> None:
+        """Remove only COMPLETED rows. FAILED and CANCELLED are kept because
+        they're recoverable via right-click Retry — sweeping them would make
+        the Retry affordance useless. Removes from end so indices stay
+        stable during iteration."""
         for i in range(len(self.jobs) - 1, -1, -1):
-            if self.jobs[i].status in terminal:
+            if self.jobs[i].status == JobStatus.COMPLETED:
                 self.beginRemoveRows(QModelIndex(), i, i)
                 del self.jobs[i]
                 self.endRemoveRows()
