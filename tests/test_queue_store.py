@@ -75,6 +75,24 @@ def test_in_flight_statuses_reset_to_pending(db: Path):
     assert all(j.status == JobStatus.PENDING for j in loaded)
 
 
+def test_bytes_done_roundtrip(db: Path):
+    """Partial-download offset must survive save/load so PAUSED rows can
+    Range-resume after a restart."""
+    jobs = [
+        DownloadJob(
+            url="u1",
+            file_code="c1",
+            status=JobStatus.PAUSED,
+            dest_path=Path("/tmp/movie.rar"),
+            bytes_done=123_456_789,
+        ),
+    ]
+    save_queue(jobs, db)
+    loaded = load_queue(db)
+    assert loaded[0].bytes_done == 123_456_789
+    assert loaded[0].status == JobStatus.PAUSED
+
+
 def test_terminal_statuses_preserved(db: Path):
     jobs = [
         DownloadJob(

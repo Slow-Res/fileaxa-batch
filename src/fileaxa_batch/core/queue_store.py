@@ -45,9 +45,20 @@ CREATE TABLE IF NOT EXISTS jobs (
     error       TEXT,
     meta_name   TEXT,
     meta_size   INTEGER,
+    bytes_done  INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 """
+
+
+def _migrate_schema(cx: sqlite3.Connection) -> None:
+    """Idempotent column-add migration. SQLite has no ALTER TABLE IF NOT
+    EXISTS for columns, so we attempt and swallow the DuplicateColumn error.
+    Cheap to call on every connect."""
+    try:
+        cx.execute("ALTER TABLE jobs ADD COLUMN bytes_done INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
 
 def queue_db_path() -> Path:
@@ -88,6 +99,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     cx = sqlite3.connect(db_path)
     cx.row_factory = sqlite3.Row
     cx.executescript(SCHEMA)  # idempotent; protects against drift
+    _migrate_schema(cx)       # bring older DBs up to date in-place
     return cx
 
 
@@ -100,8 +112,8 @@ def save_queue(jobs: List[DownloadJob], db_path: Optional[Path] = None) -> None:
             if rows:
                 cx.executemany(
                     "INSERT INTO jobs "
-                    "(url, file_code, status, dest_path, error, meta_name, meta_size) "
-                    "VALUES (:url, :file_code, :status, :dest_path, :error, :meta_name, :meta_size)",
+                    "(url, file_code, status, dest_path, error, meta_name, meta_size, bytes_done) "
+                    "VALUES (:url, :file_code, :status, :dest_path, :error, :meta_name, :meta_size, :bytes_done)",
                     rows,
                 )
 
@@ -113,7 +125,8 @@ def load_queue(db_path: Optional[Path] = None) -> List[DownloadJob]:
     try:
         with closing(_connect(db_path)) as cx:
             rows = cx.execute(
-                "SELECT url, file_code, status, dest_path, error, meta_name, meta_size "
+                "SELECT url, file_code, status, dest_path, error, "
+                "meta_name, meta_size, bytes_done "
                 "FROM jobs ORDER BY id"
             ).fetchall()
     except sqlite3.DatabaseError:
@@ -130,6 +143,7 @@ def _job_to_row(j: DownloadJob) -> dict:
         "error": j.error,
         "meta_name": j.meta.name if j.meta else None,
         "meta_size": j.meta.size if j.meta else None,
+        "bytes_done": int(j.bytes_done or 0),
     }
 
 
@@ -150,6 +164,12 @@ def _row_to_job(r: sqlite3.Row) -> DownloadJob:
             size=r["meta_size"],
         )
     dest_path = Path(r["dest_path"]) if r["dest_path"] else None
+    bytes_done = 0
+    try:
+        bytes_done = int(r["bytes_done"] or 0)
+    except (KeyError, IndexError, TypeError):
+        # Pre-migration row from an older DB that didn't have the column.
+        pass
     return DownloadJob(
         url=r["url"],
         file_code=r["file_code"],
@@ -157,4 +177,5 @@ def _row_to_job(r: sqlite3.Row) -> DownloadJob:
         meta=meta,
         dest_path=dest_path,
         error=r["error"],
+        bytes_done=bytes_done,
     )
