@@ -1,3 +1,62 @@
+# fileaxa-batch v0.3.0
+
+**If you're on v0.2.0, upgrade.** v0.2.0 ships a streaming-progress
+threading bug that makes Chromium download the file fine but the app
+mark every job FAILED. This release fixes that, plus adds retry,
+install/update shell tooling, and a friendlier launcher alias.
+
+## Fixes
+
+- **Downloads no longer FAIL when they succeed.** v0.2.0 ran
+  `download.save_as()` inside a daemon thread to free up the worker for
+  progress polling — but Playwright's sync API is not thread-safe, so
+  every save_as call threw a thread-affinity error. The job was marked
+  FAILED even though Chromium had downloaded the bytes. Now save_as runs
+  on the Playwright-owning thread and the polling moves to a daemon
+  instead. Speed/ETA columns work exactly the same; only the threading
+  topology changed.
+
+## What's new
+
+- **Right-click Retry** on the queue table. Highlights any FAILED or
+  CANCELLED rows in your selection (multi-select supported), flips them
+  back to PENDING, and clears stale error / progress stats. Idle workers
+  pick them up automatically.
+- **`bin/install`** — idempotent setup script. Works as a `curl`-able
+  one-liner for fresh installs or as `./bin/install` from an existing
+  checkout. Clones the repo, makes a `.venv`, installs Playwright
+  Chromium, symlinks the launcher into `~/.local/bin`. Detects
+  apt/dnf/brew so it can print the right one-liner for distros that
+  need extra system packages.
+- **`bin/update`** — fast-forward pull from `origin/main` + `pip install
+  -e .` to pick up any pyproject changes. Refuses to run with
+  uncommitted edits so a stray pull can't clobber your work.
+- **`bin/start`** — friendlier alias for `bin/fileaxa-batch`.
+- **`bin/fileaxa-batch`** — symlink-aware launcher that runs the project
+  with its local `.venv`. Suitable for symlinking into `~/.local/bin`.
+- **App icon** — bundled SVG (rounded square + download arrow) replaces
+  the generic Qt window icon. Shows in title bar, taskbar, and alt-tab.
+  Placeholder design — easy to swap by replacing
+  `src/fileaxa_batch/data/icon.svg`. Falls back to the system `download`
+  theme icon if the SVG can't be loaded.
+
+## Upgrade path
+
+From a checkout:
+```bash
+cd ~/fileaxa-batch && bin/update
+```
+
+Fresh install on a new machine:
+```bash
+curl -fsSL https://raw.githubusercontent.com/Slow-Res/fileaxa-batch/main/bin/install | bash
+```
+
+Your `queue.db` is forward-compatible — no migration. Any rows stuck at
+FAILED from v0.2.0 can be right-click → Retry'd in this version.
+
+---
+
 # fileaxa-batch v0.2.0
 
 Quality-of-life release focused on the queue table — it now actually shows
