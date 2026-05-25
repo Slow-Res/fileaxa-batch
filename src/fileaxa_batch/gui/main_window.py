@@ -415,6 +415,32 @@ class MainWindow(QMainWindow):
         )
         menu.addAction(cancel_action)
 
+        menu.addSeparator()
+
+        # Utility actions — apply to any selection, regardless of status.
+        all_selected = [
+            self._proxy.mapToSource(i).row()
+            for i in self._table.selectionModel().selectedRows()
+        ]
+        all_selected = [r for r in all_selected if 0 <= r < len(self._jobs)]
+
+        open_action = QAction("Open containing folder", self._table)
+        open_action.setEnabled(bool(all_selected))
+        open_action.triggered.connect(
+            lambda: self._open_containing_folder(all_selected)
+        )
+        menu.addAction(open_action)
+
+        delete_action = QAction(
+            f"Delete record ({len(all_selected)})"
+            if all_selected
+            else "Delete record",
+            self._table,
+        )
+        delete_action.setEnabled(bool(all_selected))
+        delete_action.triggered.connect(lambda: self._delete_rows(all_selected))
+        menu.addAction(delete_action)
+
         menu.exec(self._table.viewport().mapToGlobal(pos))
 
     def _selected_rows_with_status(self, *allowed: JobStatus) -> List[int]:
@@ -506,6 +532,60 @@ class MainWindow(QMainWindow):
             self._model.refresh_row(row)
             overridden += 1
         self._append_log(f"override applied to {overridden} row(s)")
+        self._persist_queue()
+        self._refresh_running_state()
+
+    def _open_containing_folder(self, rows: List[int]) -> None:
+        """Open the first selected row's containing folder in the system
+        file manager. macOS and Windows additionally select the file; on
+        Linux there's no portable per-file-manager 'select' syntax, so we
+        just open the parent directory."""
+        if not rows:
+            return
+        job = self._jobs[rows[0]]
+        target = (
+            job.dest_path
+            if job.dest_path is not None and job.dest_path.exists()
+            else self._settings.download_dir
+        )
+        folder = target.parent if target.is_file() else target
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "darwin" and target.is_file():
+                subprocess.Popen(["open", "-R", str(target)])
+            elif sys.platform.startswith("win") and target.is_file():
+                subprocess.Popen(["explorer", f"/select,{target}"])
+            elif sys.platform.startswith("linux"):
+                subprocess.Popen(["xdg-open", str(folder)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["explorer", str(folder)])
+        except OSError as e:
+            QMessageBox.warning(self, "Open folder failed", str(e))
+
+    def _delete_rows(self, rows: List[int]) -> None:
+        """Remove rows from the queue. Files on disk are left alone — if
+        the user wants those gone they can use Clear duplicate files or
+        delete manually."""
+        if not rows:
+            return
+        ans = QMessageBox.question(
+            self,
+            "Delete record?",
+            f"Remove {len(rows)} row(s) from the queue?\n\n"
+            "Files already downloaded to disk will NOT be deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        # Remove from end so earlier indices stay valid.
+        for row in sorted(rows, reverse=True):
+            self._model.beginRemoveRows(QModelIndex(), row, row)
+            del self._jobs[row]
+            self._model.endRemoveRows()
+        self._append_log(f"deleted {len(rows)} row(s) from queue")
         self._persist_queue()
         self._refresh_running_state()
 
