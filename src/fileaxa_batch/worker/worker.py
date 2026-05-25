@@ -188,6 +188,20 @@ class DownloadWorker(QThread):
                     f"file_info failed for {job.file_code}: {e}"
                 )
 
+        # API-mode early-skip: if we already know the filename and it's
+        # sitting on disk, don't even navigate — mark COMPLETED, point at
+        # the existing file, save the timer/captcha round trip entirely.
+        if job.meta and job.meta.name:
+            existing = self.settings.download_dir / job.meta.name
+            if existing.exists():
+                job.dest_path = existing
+                job.status = JobStatus.COMPLETED
+                self.signals.worker_log.emit(
+                    f"already on disk; skipped: {existing}"
+                )
+                self.signals.job_completed.emit(idx, str(existing))
+                return
+
         try:
             path = download_one(
                 page=page,

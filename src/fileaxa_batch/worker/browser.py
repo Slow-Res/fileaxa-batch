@@ -243,6 +243,25 @@ def download_one(
         raise CancelledError()
 
     suggested = download.suggested_filename or f"fileaxa-{int(time.time())}.bin"
+    existing = dest_dir / suggested
+
+    # Disk-side dedup: if a file with the suggested name is already in the
+    # download directory we don't re-write it. Chromium has done the network
+    # work already; we just discard its temp file via download.delete().
+    if existing.exists():
+        on_status("already on disk; skipping save")
+        try:
+            download.delete()
+        except Exception:
+            pass
+        if on_metadata is not None:
+            try:
+                on_metadata(existing.name, existing.stat().st_size)
+            except OSError:
+                on_metadata(existing.name, None)
+        on_progress(existing.stat().st_size, existing.stat().st_size, 0.0, 0.0)
+        return existing
+
     target = _unique_path(dest_dir / suggested)
 
     total = _probe_total_size(page, download.url)
