@@ -93,8 +93,11 @@ BUNDLE_SIZE=$(du -sh "$BUNDLE_DIR" 2>/dev/null | awk '{print $1}')
 echo
 ok "Bundle ready: $BUNDLE_DIR ($BUNDLE_SIZE)"
 echo
-echo "To distribute, zip the entire directory:"
-echo "    cd dist && tar -czf fileaxa-batch.tar.gz fileaxa-batch"
+echo "Launch the bundled binary from here:"
+echo "    $BUNDLE_DIR/fileaxa-batch"
 echo
-echo "On the target machine, extract and run:"
+echo "To distribute, package the entire directory:"
+echo "    cd \"$(dirname "$BUNDLE_DIR")\" && tar -czf fileaxa-batch.tar.gz fileaxa-batch"
+echo
+echo "On the target machine, extract the tarball then run:"
 echo "    ./fileaxa-batch/fileaxa-batch"
