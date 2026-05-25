@@ -5,7 +5,7 @@ import sys
 from typing import List
 
 from PyQt6.QtCore import QModelIndex, Qt
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..core.dedup import delete_duplicates, find_duplicates
 from ..core.models import DownloadJob, FileMeta, JobStatus
 from ..core.queue_store import load_queue, save_queue
 from ..core.settings import AppSettings, Mode
@@ -73,24 +74,20 @@ class MainWindow(QMainWindow):
         self._resume_btn = QPushButton("Resume")
         self._spawn_btn = QPushButton(self._spawn_btn_label(0))
         self._pause_btn = QPushButton("Pause")
-        self._cancel_btn = QPushButton("Cancel current")
-        self._clear_btn = QPushButton("Clear completed")
-        self._open_btn = QPushButton("Open downloads")
-        self._settings_btn = QPushButton("Settings…")
+        # Less-frequent actions live on the menu bar only — the toolbar
+        # keeps the five most-common buttons.
         for b in (
             self._add_btn,
             self._start_btn,
             self._resume_btn,
             self._spawn_btn,
             self._pause_btn,
-            self._cancel_btn,
-            self._clear_btn,
-            self._open_btn,
-            self._settings_btn,
         ):
             bar.addWidget(b)
         bar.addStretch(1)
         root.addLayout(bar)
+
+        self._build_menu_bar()
 
         # Split: URL input / queue table / log
         split = QSplitter(Qt.Orientation.Vertical)
@@ -135,12 +132,62 @@ class MainWindow(QMainWindow):
         self._resume_btn.clicked.connect(self._on_start)
         self._spawn_btn.clicked.connect(self._on_spawn)
         self._pause_btn.clicked.connect(self._on_pause)
-        self._cancel_btn.clicked.connect(self._on_cancel)
-        self._clear_btn.clicked.connect(self._on_clear)
-        self._open_btn.clicked.connect(self._on_open_downloads)
-        self._settings_btn.clicked.connect(self._on_settings)
 
         self._refresh_running_state()
+
+    def _build_menu_bar(self) -> None:
+        """Group every action into File / Edit / Settings menus. The toolbar
+        keeps the most-frequent five buttons; everything else lives here.
+        Menu items share handlers with the toolbar so keyboard shortcuts
+        work identically."""
+        mb = self.menuBar()
+
+        # ---- File ----------------------------------------------------------
+        file_menu = mb.addMenu("&File")
+
+        act = QAction("&Add to queue", self)
+        act.setShortcut(QKeySequence("Ctrl+L"))
+        act.triggered.connect(self._on_add)
+        file_menu.addAction(act)
+
+        act = QAction("&Open downloads folder", self)
+        act.setShortcut(QKeySequence("Ctrl+O"))
+        act.triggered.connect(self._on_open_downloads)
+        file_menu.addAction(act)
+
+        file_menu.addSeparator()
+        act = QAction("&Quit", self)
+        act.setShortcut(QKeySequence.StandardKey.Quit)
+        act.triggered.connect(self.close)
+        file_menu.addAction(act)
+
+        # ---- Edit ----------------------------------------------------------
+        edit_menu = mb.addMenu("&Edit")
+
+        act = QAction("&Pause workers", self)
+        act.setShortcut(QKeySequence("Ctrl+P"))
+        act.triggered.connect(self._on_pause)
+        edit_menu.addAction(act)
+
+        act = QAction("&Cancel current jobs", self)
+        act.triggered.connect(self._on_cancel)
+        edit_menu.addAction(act)
+
+        edit_menu.addSeparator()
+        act = QAction("Clear &completed", self)
+        act.triggered.connect(self._on_clear)
+        edit_menu.addAction(act)
+
+        act = QAction("Clear &duplicate files on disk…", self)
+        act.triggered.connect(self._on_clear_duplicate_files)
+        edit_menu.addAction(act)
+
+        # ---- Settings ------------------------------------------------------
+        settings_menu = mb.addMenu("&Settings")
+        act = QAction("&Preferences…", self)
+        act.setShortcut(QKeySequence("Ctrl+,"))
+        act.triggered.connect(self._on_settings)
+        settings_menu.addAction(act)
 
     def _wire_signals(self) -> None:
         s = self._signals
@@ -424,6 +471,46 @@ class MainWindow(QMainWindow):
         self._append_log(f"cancelled {len(rows)} approval row(s)")
         self._persist_queue()
         self._refresh_running_state()
+
+    def _on_clear_duplicate_files(self) -> None:
+        """Sweep 'foo (1).rar' style leftovers next to their unsuffixed base
+        in the download directory. Asks for confirmation, shows the count,
+        and lists the files in the detail panel so nothing is deleted
+        without the user seeing exactly what's going."""
+        groups = find_duplicates(self._settings.download_dir)
+        if not groups:
+            QMessageBox.information(
+                self,
+                "No duplicates found",
+                f"No duplicate files in {self._settings.download_dir}.",
+            )
+            return
+        total_to_drop = sum(len(g.drop) for g in groups)
+        detail_lines = []
+        for g in groups:
+            detail_lines.append(f"keep:  {g.keep.name}")
+            for p in g.drop:
+                detail_lines.append(f"  drop: {p.name}")
+            detail_lines.append("")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Clear duplicate files?")
+        box.setText(
+            f"Delete {total_to_drop} duplicate file(s) across "
+            f"{len(groups)} group(s)?"
+        )
+        box.setInformativeText(
+            f"Folder: {self._settings.download_dir}"
+        )
+        box.setDetailedText("\n".join(detail_lines))
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+        deleted = delete_duplicates(groups)
+        self._append_log(f"removed {len(deleted)} duplicate file(s) from disk")
 
     def _on_open_downloads(self) -> None:
         d = self._settings.download_dir
