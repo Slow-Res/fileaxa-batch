@@ -5,11 +5,13 @@ import sys
 from typing import List
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -100,6 +102,8 @@ class MainWindow(QMainWindow):
         self._table.setModel(self._model)
         self._table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self._table.setAlternatingRowColors(True)
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_row_context_menu)
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(QueueModel.COL_URL, QHeaderView.ResizeMode.Interactive)
@@ -234,6 +238,48 @@ class MainWindow(QMainWindow):
 
     def _on_clear(self) -> None:
         self._model.remove_finished()
+        self._persist_queue()
+        self._refresh_running_state()
+
+    # ---------- Row context menu ----------
+
+    def _on_row_context_menu(self, pos) -> None:
+        """Right-click on a table row → 'Retry' for any FAILED / CANCELLED rows
+        in the current selection. Idle workers pick them up automatically; if
+        no workers are running, the user still has to hit Start."""
+        rows = self._selected_retryable_rows()
+        menu = QMenu(self._table)
+        retry_action = QAction(
+            f"Retry ({len(rows)})" if rows else "Retry", self._table
+        )
+        retry_action.setEnabled(bool(rows))
+        retry_action.triggered.connect(lambda: self._retry_rows(rows))
+        menu.addAction(retry_action)
+        menu.exec(self._table.viewport().mapToGlobal(pos))
+
+    def _selected_retryable_rows(self) -> List[int]:
+        sel = self._table.selectionModel().selectedRows()
+        retryable = (JobStatus.FAILED, JobStatus.CANCELLED)
+        return [
+            idx.row()
+            for idx in sel
+            if 0 <= idx.row() < len(self._jobs)
+            and self._jobs[idx.row()].status in retryable
+        ]
+
+    def _retry_rows(self, rows: List[int]) -> None:
+        if not rows:
+            return
+        for row in rows:
+            job = self._jobs[row]
+            job.status = JobStatus.PENDING
+            job.error = None
+            job.bytes_done = 0
+            job.total_bytes = 0
+            job.speed_bps = 0.0
+            job.eta_s = 0.0
+            self._model.refresh_row(row)
+        self._append_log(f"retry queued for {len(rows)} row(s)")
         self._persist_queue()
         self._refresh_running_state()
 
