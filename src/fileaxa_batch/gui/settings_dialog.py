@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -76,6 +77,12 @@ class SettingsDialog(QDialog):
         self._captcha.setValue(settings.captcha_timeout_seconds)
         form.addRow("CAPTCHA solve timeout:", self._captcha)
 
+        self._headless = QCheckBox(
+            "Run Chromium headless (no browser window — CAPTCHAs will fail)"
+        )
+        self._headless.setChecked(settings.headless)
+        form.addRow("Headless mode:", self._headless)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -105,6 +112,7 @@ class SettingsDialog(QDialog):
         self._settings.mode = self._mode.currentData()
         self._settings.free_timer_seconds = self._timer.value()
         self._settings.captcha_timeout_seconds = self._captcha.value()
+        self._settings.headless = self._headless.isChecked()
         self._settings.save()
         new_key = self._key_edit.text().strip()
         if new_key:
