@@ -112,45 +112,40 @@ def _save_with_progress(
     on_progress: Callable[[int, int, float, float], None],
     poll_interval: float = 0.5,
 ) -> None:
-    """Run download.save_as in a thread so we can poll target's growing size
-    and report speed + ETA. Chromium is already writing the bytes; we just
-    watch the file grow."""
-    err: list[BaseException] = []
+    """Run download.save_as in the calling thread, with a daemon poller in
+    the background reporting target's growing size as speed + ETA.
 
-    def _saver() -> None:
-        try:
-            download.save_as(target)
-        except BaseException as e:  # noqa: BLE001
-            err.append(e)
+    Playwright's sync API is NOT thread-safe — save_as must execute on the
+    same thread that owns the playwright instance. The poller only touches
+    target.stat() (pure OS) and the on_progress callback (Qt signals are
+    thread-safe across QThreads), so it's free to run anywhere.
+    """
+    stop = threading.Event()
 
-    t = threading.Thread(target=_saver, daemon=True)
-    t.start()
-
-    last_size = 0
-    last_t = time.monotonic()
-    while t.is_alive():
-        time.sleep(poll_interval)
-        try:
-            now_size = target.stat().st_size
-        except OSError:
-            now_size = last_size  # file not created yet
-        now_t = time.monotonic()
-        dt = now_t - last_t
-        speed = (now_size - last_size) / dt if dt > 0 else 0.0
-        eta = (total - now_size) / speed if (total and speed > 0) else 0.0
-        on_progress(now_size, total or -1, speed, eta)
-        last_size = now_size
-        last_t = now_t
-        if cancel_check():
+    def _poll() -> None:
+        last_size = 0
+        last_t = time.monotonic()
+        while not stop.is_set():
             try:
-                download.cancel()
-            except Exception:
-                pass
-            break
+                now_size = target.stat().st_size
+            except OSError:
+                now_size = last_size  # file not created yet
+            now_t = time.monotonic()
+            dt = now_t - last_t
+            speed = (now_size - last_size) / dt if dt > 0 else 0.0
+            eta = (total - now_size) / speed if (total and speed > 0) else 0.0
+            on_progress(now_size, total or -1, speed, eta)
+            last_size = now_size
+            last_t = now_t
+            stop.wait(poll_interval)
 
-    t.join(timeout=2.0)
-    if err:
-        raise err[0]
+    poller = threading.Thread(target=_poll, daemon=True)
+    poller.start()
+    try:
+        download.save_as(target)
+    finally:
+        stop.set()
+        poller.join(timeout=2.0)
 
 
 def download_one(
