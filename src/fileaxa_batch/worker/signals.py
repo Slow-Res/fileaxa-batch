@@ -19,3 +19,4 @@ class WorkerSignals(QObject):
     quota_updated = pyqtSignal(str)             # human-readable quota line
     worker_log = pyqtSignal(str)
     worker_stopped = pyqtSignal(int)            # worker_id of the thread that just exited
+    job_paused = pyqtSignal(int, int)           # row index, bytes_done at pause

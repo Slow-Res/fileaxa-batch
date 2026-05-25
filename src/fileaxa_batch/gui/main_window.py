@@ -197,6 +197,7 @@ class MainWindow(QMainWindow):
         s.progress.connect(self._on_progress)
         s.job_completed.connect(self._on_job_completed)
         s.job_failed.connect(self._on_job_failed)
+        s.job_paused.connect(self._on_job_paused)
         s.quota_updated.connect(self._on_quota_updated)
         s.worker_log.connect(self._append_log)
         s.worker_stopped.connect(self._on_worker_stopped)
@@ -250,18 +251,29 @@ class MainWindow(QMainWindow):
             self._refresh_running_state()
 
     def _on_start(self) -> None:
-        if self._workers:
-            for w in self._workers:
-                w.resume()
-            self._refresh_running_state()
-            self._append_log("resumed")
-            return
+        # Promote PAUSED rows back to PENDING so JobClaimer can pick them
+        # up. The worker detects job.dest_path on disk and Range-resumes.
+        resumed = 0
+        for job in self._jobs:
+            if job.status == JobStatus.PAUSED:
+                job.status = JobStatus.PENDING
+                resumed += 1
+        if resumed:
+            self._append_log(f"resuming {resumed} paused row(s)")
+            self._persist_queue()
         if not any(j.status == JobStatus.PENDING for j in self._jobs):
             QMessageBox.information(
                 self, "Nothing to do", "Queue is empty or has no pending items."
             )
             return
-        self._spawn_worker()
+        # After my pause-exits-worker change, hitting Pause kills the worker
+        # thread; the workers list may be empty even though there are rows
+        # to process. Spawn a fresh one. If workers ARE still running
+        # (e.g. some were never paused), this branch is skipped and the
+        # claimer just hands them the resumed PENDING rows.
+        if not self._workers:
+            self._spawn_worker()
+        self._refresh_running_state()
 
     def _on_spawn(self) -> None:
         if len(self._workers) >= MAX_WORKERS:
@@ -325,11 +337,13 @@ class MainWindow(QMainWindow):
             JobStatus.FAILED,
             JobStatus.CANCELLED,
             JobStatus.APPROVAL,
+            JobStatus.PAUSED,
         )
         retryable_rows = self._selected_rows_with_status(
             JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.APPROVAL
         )
         approval_rows = self._selected_rows_with_status(JobStatus.APPROVAL)
+        paused_rows = self._selected_rows_with_status(JobStatus.PAUSED)
 
         menu = QMenu(self._table)
 
@@ -340,6 +354,14 @@ class MainWindow(QMainWindow):
         start_action.setEnabled(bool(startable_rows))
         start_action.triggered.connect(lambda: self._start_rows(startable_rows))
         menu.addAction(start_action)
+
+        resume_action = QAction(
+            f"Resume ({len(paused_rows)})" if paused_rows else "Resume",
+            self._table,
+        )
+        resume_action.setEnabled(bool(paused_rows))
+        resume_action.triggered.connect(lambda: self._start_rows(paused_rows))
+        menu.addAction(resume_action)
 
         retry_action = QAction(
             f"Retry ({len(retryable_rows)})" if retryable_rows else "Retry",
@@ -390,12 +412,17 @@ class MainWindow(QMainWindow):
         for row in rows:
             job = self._jobs[row]
             if job.status != JobStatus.PENDING:
+                was_paused = job.status == JobStatus.PAUSED
                 job.status = JobStatus.PENDING
                 job.error = None
-                job.bytes_done = 0
-                job.total_bytes = 0
-                job.speed_bps = 0.0
-                job.eta_s = 0.0
+                # PAUSED rows keep their byte/speed stats so the table
+                # doesn't briefly show 0 before the worker's first emit.
+                # Retry/approval flips reset everything for a fresh start.
+                if not was_paused:
+                    job.bytes_done = 0
+                    job.total_bytes = 0
+                    job.speed_bps = 0.0
+                    job.eta_s = 0.0
                 self._model.refresh_row(row)
         if not self._workers and len(self._workers) < MAX_WORKERS:
             self._spawn_worker()
@@ -580,6 +607,12 @@ class MainWindow(QMainWindow):
         self._append_log(f"✗ row {idx + 1}: {err}")
         self._persist_queue()
 
+    def _on_job_paused(self, idx: int, offset: int) -> None:
+        self._model.refresh_row(idx)
+        self._append_log(f"⏸ row {idx + 1} paused at {offset} bytes")
+        self._persist_queue()
+        self._refresh_running_state()
+
     def _on_quota_updated(self, text: str) -> None:
         self._quota_label.setText(text)
 
@@ -601,14 +634,19 @@ class MainWindow(QMainWindow):
 
     def _refresh_running_state(self) -> None:
         running = len(self._workers) > 0
-        has_pending = any(j.status == JobStatus.PENDING for j in self._jobs)
-        self._start_btn.setEnabled(not running and has_pending)
-        self._resume_btn.setEnabled(not running and has_pending)
+        # PAUSED rows also count as "things the user can start" — Start
+        # flips them back to PENDING en masse, so the toolbar should stay
+        # active until everything is truly resolved.
+        has_actionable = any(
+            j.status in (JobStatus.PENDING, JobStatus.PAUSED)
+            for j in self._jobs
+        )
+        self._start_btn.setEnabled(not running and has_actionable)
+        self._resume_btn.setEnabled(not running and has_actionable)
         self._pause_btn.setEnabled(running)
-        self._cancel_btn.setEnabled(running)
         self._spawn_btn.setText(self._spawn_btn_label(len(self._workers)))
         self._spawn_btn.setEnabled(
-            len(self._workers) < MAX_WORKERS and has_pending
+            len(self._workers) < MAX_WORKERS and has_actionable
         )
 
     @staticmethod
@@ -629,13 +667,20 @@ class MainWindow(QMainWindow):
             ans = QMessageBox.question(
                 self,
                 "Workers running",
-                f"{len(running)} download worker(s) in progress. Stop and exit?",
+                f"{len(running)} download worker(s) in progress. "
+                "Pause and exit?\n\n"
+                "In-flight downloads will be saved as PAUSED with their "
+                "current partial files preserved on disk. Relaunch and "
+                "click Start to resume from where you left off.",
             )
             if ans != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+            # pause() also sets _stop so each worker exits after marking its
+            # current job PAUSED. Wait up to 10s — enough for a chunk loop
+            # tick + Playwright context teardown.
             for w in running:
-                w.request_stop()
+                w.pause()
             for w in running:
-                w.wait(5000)
+                w.wait(10000)
         event.accept()

@@ -11,7 +11,7 @@ from ..api.errors import ApiError, AuthError
 from ..core.models import DownloadJob, FileMeta, JobStatus
 from ..core.settings import AppSettings, Mode
 from ..secrets import get_api_key
-from .browser import CancelledError, download_one
+from .browser import CancelledError, PausedAtOffset, download_one
 from .signals import WorkerSignals
 
 
@@ -87,9 +87,22 @@ class DownloadWorker(QThread):
         self._cancel_current.set()
 
     def pause(self) -> None:
+        # Pause is a clean shutdown: tell the in-flight chunk loop to stop
+        # (cancel_current) while also setting _paused so the loop saves
+        # partial state as PAUSED rather than CANCELLED. Then _stop fires
+        # so the worker thread exits after the current job is marked —
+        # frees the Chromium browser and the thread itself. To resume, the
+        # GUI spawns a fresh worker which claims the PAUSED-then-flipped-to
+        # -PENDING row.
         self._paused.set()
+        self._cancel_current.set()
+        self._stop.set()
 
     def resume(self) -> None:
+        # Kept for API symmetry, though after the pause-stops-worker change
+        # the worker may have already exited. The GUI's resume path is to
+        # spawn a new worker via _spawn_worker(), not to "unpause" a dead
+        # thread.
         self._paused.clear()
 
     # ---- worker loop ----
@@ -188,19 +201,45 @@ class DownloadWorker(QThread):
                     f"file_info failed for {job.file_code}: {e}"
                 )
 
-        # API-mode early-skip: if we already know the filename and it's
-        # sitting on disk, don't even navigate — mark COMPLETED, point at
-        # the existing file, save the timer/captcha round trip entirely.
+        # API-mode early-skip: if we already know the filename AND its size
+        # matches the file already on disk, mark COMPLETED and skip the
+        # whole timer/captcha round trip. If size DOESN'T match, the file
+        # is partial — fall through and let download_one handle it (HTTPX
+        # mode will Range-resume; Playwright will overwrite).
         if job.meta and job.meta.name:
             existing = self.settings.download_dir / job.meta.name
             if existing.exists():
-                job.dest_path = existing
-                job.status = JobStatus.COMPLETED
-                self.signals.worker_log.emit(
-                    f"already on disk; skipped: {existing}"
-                )
-                self.signals.job_completed.emit(idx, str(existing))
-                return
+                try:
+                    on_disk = existing.stat().st_size
+                except OSError:
+                    on_disk = 0
+                expected = job.meta.size or 0
+                if expected > 0 and on_disk != expected:
+                    job.dest_path = existing
+                    job.bytes_done = on_disk
+                    self.signals.worker_log.emit(
+                        f"partial on disk ({on_disk}/{expected}); "
+                        f"will resume {job.meta.name}"
+                    )
+                    # Fall through. download_one detects job.dest_path on
+                    # disk and dispatches to the resume path.
+                else:
+                    job.dest_path = existing
+                    job.status = JobStatus.COMPLETED
+                    self.signals.worker_log.emit(
+                        f"already on disk; skipped: {existing}"
+                    )
+                    self.signals.job_completed.emit(idx, str(existing))
+                    return
+
+        # Resume detection: a job whose dest_path now exists on disk —
+        # either from a PAUSED row, or from the partial-mismatch branch
+        # above — gets resume_target set so download_one can Range-resume.
+        resume_target = (
+            job.dest_path
+            if job.dest_path is not None and job.dest_path.exists()
+            else None
+        )
 
         try:
             path = download_one(
@@ -219,10 +258,19 @@ class DownloadWorker(QThread):
                 ),
                 download_mode=self.settings.download_mode,
                 on_log=self.signals.worker_log.emit,
+                pause_check=self._paused.is_set,
+                resume_target=resume_target,
             )
             job.dest_path = path
             job.status = JobStatus.COMPLETED
             self.signals.job_completed.emit(idx, str(path))
+        except PausedAtOffset as e:
+            # User clicked Pause mid-download. Keep dest_path and the
+            # partial file on disk; a future Resume will pick it up via
+            # the resume_target path above.
+            job.bytes_done = e.offset
+            job.status = JobStatus.PAUSED
+            self.signals.job_paused.emit(idx, e.offset)
         except CancelledError:
             job.status = JobStatus.CANCELLED
             self.signals.job_failed.emit(idx, "cancelled")

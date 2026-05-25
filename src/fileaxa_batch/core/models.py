@@ -9,6 +9,7 @@ from typing import Optional
 class JobStatus(str, Enum):
     PENDING = "pending"
     APPROVAL = "approval"
+    PAUSED = "paused"
     FETCHING_METADATA = "fetching metadata"
     NAVIGATING = "navigating"
     WAITING_TIMER = "waiting timer"

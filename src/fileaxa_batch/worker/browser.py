@@ -1,6 +1,7 @@
 """Per-job Playwright flow. Pure functions over a Playwright Page; no Qt here."""
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
@@ -9,7 +10,36 @@ from typing import Callable, Optional
 import httpx
 from playwright.sync_api import Download, Page, Request, TimeoutError as PWTimeout
 
-from ..core.settings import DownloadMode
+from ..core.settings import DownloadMode, config_dir
+
+
+# File-backed logger for the httpx transport. Writes to
+# ~/.config/fileaxa-batch/httpx.log so failures can be inspected after the
+# fact — the GUI log only retains the last 500 lines.
+_httpx_logger: Optional[logging.Logger] = None
+
+
+def _get_httpx_logger() -> logging.Logger:
+    global _httpx_logger
+    if _httpx_logger is not None:
+        return _httpx_logger
+    log = logging.getLogger("fileaxa_batch.httpx")
+    log.setLevel(logging.DEBUG)
+    log.propagate = False
+    try:
+        log_path = config_dir() / "httpx.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        )
+        log.addHandler(handler)
+    except OSError:
+        # If we can't open the log file (read-only fs, permission), fall
+        # back to a NullHandler so log.* calls remain safe.
+        log.addHandler(logging.NullHandler())
+    _httpx_logger = log
+    return log
 
 
 # Fileaxa free-tier flow uses an HTML form posted back to the same URL.
@@ -37,6 +67,16 @@ _CREATE_LINK_SELECTORS = (
 
 class CancelledError(RuntimeError):
     """Raised when a job is cancelled mid-flight."""
+
+
+class PausedAtOffset(RuntimeError):
+    """Raised by _httpx_download when the chunk loop sees pause_check fire.
+    Carries the partial byte count so the worker can mark the row PAUSED
+    and the on-disk file is left intact for a future Range-based resume."""
+
+    def __init__(self, offset: int) -> None:
+        self.offset = offset
+        super().__init__(f"paused at {offset} bytes")
 
 
 def _try_click(page: Page, selectors: tuple[str, ...]) -> bool:
@@ -158,26 +198,74 @@ def _httpx_download(
     total: Optional[int],
     cancel_check: Callable[[], bool],
     on_progress: Callable[[int, int, float, float], None],
+    pause_check: Callable[[], bool] = lambda: False,
+    resume_offset: int = 0,
 ) -> int:
     """Stream the file via httpx with the browser's headers + cookies copied
     over. Returns the final byte count. Bypasses Playwright entirely for the
-    bytes, which is the only way to surface real-time progress."""
+    bytes, which is the only way to surface real-time progress.
+
+    resume_offset > 0 sends a Range request and appends to target, allowing
+    a paused download to continue exactly where it left off.
+
+    During the chunk loop:
+      - cancel_check() True + pause_check() True  → save partial, raise
+        PausedAtOffset(done). File on disk is preserved at its current size.
+      - cancel_check() True + pause_check() False → true cancel: unlink the
+        file and raise CancelledError.
+    """
+    log = _get_httpx_logger()
+    request_headers = dict(headers)
+    if resume_offset > 0:
+        request_headers["range"] = f"bytes={resume_offset}-"
+    log.info(
+        "GET %s\n  headers=%r\n  cookies=%r\n  target=%s  resume_offset=%d",
+        download_url, request_headers, cookies, target, resume_offset,
+    )
     timeout = httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=60.0)
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
         with client.stream(
-            "GET", download_url, headers=headers, cookies=cookies
+            "GET", download_url, headers=request_headers, cookies=cookies
         ) as resp:
+            if resp.status_code >= 400:
+                log.error(
+                    "CDN rejected with %s\n  response_headers=%r",
+                    resp.status_code, dict(resp.headers),
+                )
             resp.raise_for_status()
+            # If we requested a Range but the server returned 200 (full
+            # content), our resume_offset assumption is invalid — truncate
+            # and re-download from scratch.
+            ranged_response = resp.status_code == 206
+            if resume_offset > 0 and not ranged_response:
+                log.warning(
+                    "Server ignored Range header for %s; restarting from 0",
+                    download_url,
+                )
+                resume_offset = 0
             cl = resp.headers.get("content-length")
             actual_total = total or (int(cl) if cl and cl.isdigit() else None)
 
-            done = 0
-            last_emit_t = time.monotonic()
-            last_emit_done = 0
+            # Total displayed to UI = (already-on-disk) + (still-to-stream).
+            # Server's Content-Length on a Range response is just the
+            # remaining bytes, so add the offset back to get the file's
+            # actual final size.
+            if ranged_response and actual_total is not None:
+                actual_total = resume_offset + actual_total
 
-            with target.open("wb") as f:
+            done = resume_offset
+            last_emit_t = time.monotonic()
+            last_emit_done = done
+
+            file_mode = "ab" if ranged_response and resume_offset > 0 else "wb"
+            with target.open(file_mode) as f:
                 for chunk in resp.iter_bytes(chunk_size=64 * 1024):
                     if cancel_check():
+                        if pause_check():
+                            # Paused: leave file on disk at current size.
+                            on_progress(done, actual_total or -1, 0.0, 0.0)
+                            log.info("PAUSED %s at %d bytes", download_url, done)
+                            raise PausedAtOffset(done)
                         try:
                             target.unlink()
                         except OSError:
@@ -198,6 +286,7 @@ def _httpx_download(
                         last_emit_t = now
                         last_emit_done = done
             on_progress(done, done, 0.0, 0.0)
+            log.info("OK %s bytes=%d", download_url, done)
             return done
 
 
@@ -213,6 +302,8 @@ def download_one(
     on_metadata: Optional[Callable[[str, Optional[int]], None]] = None,
     download_mode: DownloadMode = DownloadMode.PLAYWRIGHT,
     on_log: Optional[Callable[[str], None]] = None,
+    pause_check: Optional[Callable[[], bool]] = None,
+    resume_target: Optional[Path] = None,
 ) -> Path:
     """Drive one Fileaxa free-tier download. Returns the saved path.
 
@@ -324,30 +415,68 @@ def download_one(
     suggested = download.suggested_filename or f"fileaxa-{int(time.time())}.bin"
     existing = dest_dir / suggested
 
-    # Disk-side dedup: if a file with the suggested name is already in the
-    # download directory we abort Chromium's in-flight transfer and return
-    # the existing path. download.cancel() (NOT download.delete() — that
-    # blocks until the transfer finishes, defeating the whole point) tells
-    # the browser to stop mid-bytes.
+    # Cache the HEAD probe result — both the dedup check below and the
+    # progress-display code further down need it. One probe per job.
+    expected_total: Optional[int] = None
+
+    # Disk-side dedup with SIZE check. The bare 'file exists' heuristic was
+    # too eager — a partial file from a previous cancel/crash fooled it
+    # into marking complete. Compare against the CDN's Content-Length via
+    # HEAD probe; only short-circuit when sizes match.
     if existing.exists():
-        on_status("already on disk; skipping save")
-        # Emit metadata first so the table populates even if cancel() lags.
         try:
             existing_size = existing.stat().st_size
         except OSError:
             existing_size = 0
-        if on_metadata is not None:
-            on_metadata(existing.name, existing_size or None)
-        on_progress(existing_size, existing_size, 0.0, 0.0)
-        try:
-            download.cancel()
-        except Exception:
-            pass
-        return existing
+        expected_total = _probe_total_size(page, download.url)
+        sizes_match = (
+            expected_total is not None and existing_size == expected_total
+        )
+        if sizes_match or (expected_total is None and existing_size > 0):
+            on_status("already on disk; skipping save")
+            if on_metadata is not None:
+                on_metadata(existing.name, existing_size or None)
+            on_progress(existing_size, existing_size, 0.0, 0.0)
+            try:
+                download.cancel()
+            except Exception:
+                pass
+            return existing
+        # Size mismatch — partial file. Resolution depends on transport:
+        #   HTTPX  → resume via Range from existing_size
+        #   PLAYWRIGHT → save_as overwrites from byte 0, so the partial
+        #                gets deleted to make room.
+        if download_mode == DownloadMode.HTTPX:
+            on_status(
+                f"partial on disk ({existing_size}/{expected_total}); resuming"
+            )
+            if resume_target is None:
+                resume_target = existing
+            # Fall through to the normal download path; resume_target is
+            # picked up below and the HTTPX branch Range-requests from the
+            # current on-disk size.
+        else:
+            on_status(
+                f"partial on disk ({existing_size}/{expected_total}); "
+                f"redownloading (Playwright save_as cannot resume)"
+            )
+            try:
+                existing.unlink()
+            except OSError:
+                pass
 
-    target = _unique_path(dest_dir / suggested)
+    # If resume_target is set, the caller is continuing a paused download
+    # and the on-disk path is fixed (don't unique-suffix it). Otherwise
+    # generate a fresh unique target.
+    if resume_target is not None:
+        target = resume_target
+    else:
+        target = _unique_path(dest_dir / suggested)
 
-    total = _probe_total_size(page, download.url)
+    # Reuse the dedup probe if we already made one; otherwise probe now.
+    total = expected_total if expected_total is not None else _probe_total_size(
+        page, download.url
+    )
 
     # Emit name + (possibly) total size before bytes start flowing so the table
     # populates immediately, even in headless mode where there's no Chromium UI.
@@ -379,6 +508,13 @@ def download_one(
             # httpx manages Host / Connection / Content-Length itself.
             for h in ("host", "connection", "content-length"):
                 headers.pop(h, None)
+            # Strip HTTP/2 pseudo-headers (:authority, :method, :path,
+            # :scheme). They're valid only in HPACK-encoded HTTP/2 frames
+            # — httpcore rejects them as illegal HTTP/1.1 header names.
+            # httpx reconstructs Host (== :authority) and the request line
+            # from the URL itself.
+            for h in [k for k in headers if k.startswith(":")]:
+                headers.pop(h, None)
             cookies = {
                 c["name"]: c["value"]
                 for c in page.context.cookies(download.url)
@@ -393,6 +529,20 @@ def download_one(
                 download.cancel()  # stop Playwright's duplicate transfer
             except Exception:
                 pass
+            # Resume offset = whatever is already on disk at the target.
+            # We do this AFTER the navigation/click flow so the CDN URL is
+            # fresh; if the user paused hours ago, the original token may
+            # have expired but the just-captured URL is brand new.
+            resume_offset = 0
+            if resume_target is not None and target.exists():
+                try:
+                    resume_offset = target.stat().st_size
+                    if resume_offset > 0:
+                        on_status(
+                            f"resuming from {resume_offset} bytes"
+                        )
+                except OSError:
+                    resume_offset = 0
             try:
                 _httpx_download(
                     target,
@@ -402,17 +552,39 @@ def download_one(
                     total,
                     cancel_check,
                     on_progress,
+                    pause_check=pause_check or (lambda: False),
+                    resume_offset=resume_offset,
                 )
+            except PausedAtOffset:
+                # Propagate untouched so the worker can mark the row PAUSED
+                # rather than CANCELLED / FAILED.
+                raise
             except httpx.HTTPStatusError as e:
+                _get_httpx_logger().exception(
+                    "HTTPStatusError for %s (status=%s)",
+                    download.url, e.response.status_code,
+                )
                 raise RuntimeError(
                     f"httpx download rejected by CDN "
-                    f"({e.response.status_code}); the captured headers "
-                    "may not match what Chromium actually sent"
+                    f"({e.response.status_code}); see "
+                    f"{config_dir()}/httpx.log for the exact request/response"
                 ) from e
             except httpx.HTTPError as e:
+                _get_httpx_logger().exception(
+                    "HTTPError for %s", download.url,
+                )
                 raise RuntimeError(
-                    f"httpx download failed: {type(e).__name__}: {e}"
+                    f"httpx download failed: {type(e).__name__}: {e}; "
+                    f"see {config_dir()}/httpx.log for the traceback"
                 ) from e
+            except Exception:
+                # Anything unexpected (file IO, cancellation, etc.) — still
+                # capture for post-mortem rather than letting it die silent.
+                _get_httpx_logger().exception(
+                    "Unexpected exception during httpx download of %s",
+                    download.url,
+                )
+                raise
     else:
         _save_with_progress(download, target, total, cancel_check, on_progress)
 
