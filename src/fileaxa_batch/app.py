@@ -1,13 +1,28 @@
 from __future__ import annotations
 
+import os
 import sys
 from importlib.resources import files
+from pathlib import Path
 
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
 from .core.settings import AppSettings
 from .gui.main_window import MainWindow
+
+
+def _bootstrap_bundled_chromium() -> None:
+    """When running from a PyInstaller bundle, point Playwright at the
+    Chromium we shipped alongside the executable. No-op during normal
+    source / pip runs (sys.frozen is only set by PyInstaller)."""
+    if not getattr(sys, "frozen", False):
+        return
+    if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+        return  # user override wins
+    browsers = Path(sys.executable).parent / "browsers"
+    if browsers.exists():
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers)
 
 
 def _load_app_icon() -> QIcon:
@@ -24,6 +39,7 @@ def _load_app_icon() -> QIcon:
 
 
 def main() -> int:
+    _bootstrap_bundled_chromium()
     app = QApplication(sys.argv)
     app.setApplicationName("fileaxa-batch")
     app.setOrganizationName("fileaxa-batch")
