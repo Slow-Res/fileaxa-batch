@@ -28,6 +28,5 @@ cookies.json
 .playwright-mcp/
 
 # Ad-hoc recon / e2e scripts
-_recon*.py
-_psdly_recon.py
+_*recon*.py
 _e2e.py

@@ -26,7 +26,7 @@ from ..core.dedup import delete_duplicates, find_duplicates
 from ..core.models import DownloadJob, FileMeta, JobStatus
 from ..core.queue_store import load_queue, save_queue
 from ..core.settings import AppSettings, Mode
-from ..core.urls import parse_file_code
+from ..core.urls import extract_urls, parse_file_code
 from ..worker.signals import WorkerSignals
 from ..worker.worker import DownloadWorker, JobClaimer
 from .sidebar import StatusFilterProxy, StatusSidebar
@@ -234,14 +234,24 @@ class MainWindow(QMainWindow):
         added = 0
         approval = 0
         skipped = 0
-        for line in text.splitlines():
-            url = line.strip()
-            if not url or url.startswith("#"):
-                continue
+        # Use the tolerant URL extractor so the same paste workflow handles
+        # plain one-per-line input, JSON arrays, markdown lists, comma-
+        # separated dumps, etc. — strips surrounding punctuation before
+        # validation.
+        urls = extract_urls(text)
+        # Track tokens we've seen this paste to count "skipped" only for
+        # genuinely unparseable input, not for parseable-but-already-queued.
+        seen_codes: set[str] = set()
+        for url in urls:
             code = parse_file_code(url)
             if not code:
                 skipped += 1
                 continue
+            if code in seen_codes:
+                # The same URL appeared twice in the SAME paste — silently
+                # collapse instead of producing two APPROVAL rows.
+                continue
+            seen_codes.add(code)
             # Queue-side dedup: if the file_code is already enqueued in any
             # status, the new row enters as APPROVAL — the user decides
             # Retry / Override / Cancel via the row context menu.

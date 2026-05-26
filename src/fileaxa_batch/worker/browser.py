@@ -336,11 +336,12 @@ def download_one(
     if cancel_check():
         raise CancelledError()
 
-    # psdly redirector: the page shows a verification spinner for ~20s and
-    # then JS-redirects the browser to fileaxa.com. Wait for the URL to
-    # actually flip before continuing with the fileaxa-side flow.
-    if "psdly" in url.lower() and "fileaxa.com" not in page.url:
-        on_status("psdly: waiting for redirect to fileaxa")
+    # Wait-page redirector: if the input URL is not fileaxa, give the page
+    # up to 60s to JS-redirect into fileaxa.com before continuing. This
+    # covers the various "click then wait then download" intermediary
+    # sites that wrap fileaxa links.
+    if "fileaxa.com" not in page.url:
+        on_status("waiting for redirect to fileaxa")
         try:
             page.wait_for_url(
                 lambda u: "fileaxa.com" in u,
@@ -348,12 +349,12 @@ def download_one(
             )
         except PWTimeout:
             raise TimeoutError(
-                "psdly did not redirect to fileaxa within 60s "
-                "(verification page may have changed)"
+                "did not redirect to fileaxa within 60s "
+                "(wait page may have changed)"
             )
         if cancel_check():
             raise CancelledError()
-        on_status("navigating (fileaxa, post-psdly)")
+        on_status("navigating (post-redirect)")
         try:
             page.wait_for_load_state("domcontentloaded", timeout=15_000)
         except PWTimeout:
