@@ -146,7 +146,20 @@ class DownloadWorker(QThread):
                     except Exception:
                         pass
         except Exception as e:
-            self.signals.worker_log.emit(f"worker fatal: {type(e).__name__}: {e}")
+            msg = str(e)
+            # Translate the noisy Playwright/Chromium launch failure into a
+            # one-liner that points at the actual cause.
+            if "Maximum number of clients reached" in msg or "Missing X server" in msg:
+                self.signals.worker_log.emit(
+                    f"worker {self.worker_id} fatal: X11 is out of client "
+                    "slots. Each headed Chromium uses ~50 slots and the "
+                    "default cap is ~256. Pause some workers (or close "
+                    "other apps) and try again."
+                )
+            else:
+                self.signals.worker_log.emit(
+                    f"worker {self.worker_id} fatal: {type(e).__name__}: {e}"
+                )
         finally:
             if api_client is not None:
                 api_client.close()

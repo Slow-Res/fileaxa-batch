@@ -35,6 +35,12 @@ from .settings_dialog import SettingsDialog
 from .widgets import UrlInput
 
 MAX_WORKERS = 4
+# When workers run headed (either because headless is off, or because there
+# are redirector URLs in the queue and the worker auto-overrode), each
+# Chromium eats ~40-60 X11 client slots. The default X server cap is ~256,
+# so four headed Chromiums plus the main app routinely exhaust it. Cap
+# concurrent headed workers conservatively.
+MAX_HEADED_WORKERS = 2
 
 
 class MainWindow(QMainWindow):
@@ -309,7 +315,7 @@ class MainWindow(QMainWindow):
         self._refresh_running_state()
 
     def _on_spawn(self) -> None:
-        if len(self._workers) >= MAX_WORKERS:
+        if len(self._workers) >= self._effective_max_workers():
             return
         if not any(j.status == JobStatus.PENDING for j in self._jobs):
             QMessageBox.information(
@@ -761,15 +767,29 @@ class MainWindow(QMainWindow):
         self._start_btn.setEnabled(not running and has_actionable)
         self._resume_btn.setEnabled(not running and has_actionable)
         self._pause_btn.setEnabled(running)
-        self._spawn_btn.setText(self._spawn_btn_label(len(self._workers)))
+        effective_max = self._effective_max_workers()
+        self._spawn_btn.setText(
+            self._spawn_btn_label(len(self._workers), effective_max)
+        )
         self._spawn_btn.setEnabled(
-            len(self._workers) < MAX_WORKERS and has_actionable
+            len(self._workers) < effective_max and has_actionable
         )
         self._sidebar.update_counts(self._jobs)
 
+    def _effective_max_workers(self) -> int:
+        """Cap concurrent workers at MAX_HEADED_WORKERS when any worker
+        would run headed — either because the user disabled headless
+        globally, or because there's a redirector URL pending and the
+        worker auto-overrides to headed. Avoids X11-client exhaustion."""
+        any_headed = not self._settings.headless or any(
+            j.status == JobStatus.PENDING and "fileaxa.com" not in j.url
+            for j in self._jobs
+        )
+        return MAX_HEADED_WORKERS if any_headed else MAX_WORKERS
+
     @staticmethod
-    def _spawn_btn_label(count: int) -> str:
-        return f"+ Worker ({count}/{MAX_WORKERS})"
+    def _spawn_btn_label(count: int, cap: int = MAX_WORKERS) -> str:
+        return f"+ Worker ({count}/{cap})"
 
     def _refresh_sidebar_counts(self, *_args) -> None:
         self._sidebar.update_counts(self._jobs)
