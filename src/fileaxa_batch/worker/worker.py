@@ -119,9 +119,7 @@ class DownloadWorker(QThread):
         if not self.settings.headless:
             return False
         for job in self.jobs:
-            if job.status != JobStatus.PENDING:
-                continue
-            if "fileaxa.com" not in job.url:
+            if job.status == JobStatus.PENDING and "fileaxa.com" not in job.url:
                 return False
         return True
 
@@ -135,34 +133,25 @@ class DownloadWorker(QThread):
                         f"worker {self.worker_id}: redirector URL detected, "
                         f"running headed"
                     )
-                # Chromium launch flags chosen to minimise X11 client usage:
-                #   --disable-gpu              skip the GPU process
-                #                              (its GLX context burns slots)
-                #   --disable-software-rasterizer
-                #                              don't respawn GPU for SW fallback
-                #   --no-zygote                skip the zygote/fork-server
-                #                              process (saves another slot)
-                # Together these save ~5-7 X11 client slots per Chromium —
-                # noticeable when the X server is near its cap.
-                browser = p.chromium.launch(
-                    headless=headless,
-                    args=[
-                        "--disable-gpu",
-                        "--disable-software-rasterizer",
-                        "--no-zygote",
-                    ],
-                )
+                # No special launch args — the --disable-gpu / --no-zygote
+                # X-savings combo was tripping Cloudflare's bot scoring
+                # (WebGL reports SwiftShader, the process tree looks
+                # automated). Without these flags the Chromium fingerprint
+                # matches a real desktop browser. If you hit X11 client
+                # exhaustion again, close some Chrome tabs or raise
+                # MaxClients — see bin/diagnose-x.
+                browser = p.chromium.launch(headless=headless)
                 context = browser.new_context(accept_downloads=True)
                 page = context.new_page()
-                # Patch the page to evade Cloudflare Turnstile / bot
-                # detection: navigator.webdriver -> undefined, real
-                # chrome.runtime, plausible plugin list, WebGL vendor
-                # string, etc. Without this, the launch flags we set
-                # above (--no-sandbox, --disable-gpu, --no-zygote) trip
-                # CF's automation heuristics. Stealth restores the
-                # browser fingerprint at the JS-runtime layer.
+                # Patch the page to evade Cloudflare Turnstile bot
+                # detection. chrome_runtime is OFF by default in the
+                # library (some sites detect the patch itself) but
+                # Cloudflare specifically requires window.chrome.runtime
+                # to exist — turning it ON moves us across the threshold
+                # for the "verify you are human" checkbox to actually
+                # validate.
                 try:
-                    Stealth().apply_stealth_sync(page)
+                    Stealth(chrome_runtime=True).apply_stealth_sync(page)
                 except Exception as e:
                     self.signals.worker_log.emit(
                         f"worker {self.worker_id}: stealth setup failed "
