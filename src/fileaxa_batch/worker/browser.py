@@ -338,20 +338,37 @@ def download_one(
         raise CancelledError()
 
     # Wait-page redirector: if the input URL is not fileaxa, give the page
-    # up to 60s to JS-redirect into fileaxa.com before continuing. This
-    # covers the various "click then wait then download" intermediary
-    # sites that wrap fileaxa links.
+    # up to 120s to JS-redirect into fileaxa.com before continuing.
+    # Polling-loop instead of wait_for_url so the user can see progress
+    # ("still waiting (15s)") and Cancel actually interrupts. Some
+    # Cloudflare challenges add their own delay before psdly's own 20s
+    # ad-revenue countdown even starts, so 60s wasn't always enough.
     if "fileaxa.com" not in page.url:
         on_status("waiting for redirect to fileaxa")
-        try:
-            page.wait_for_url(
-                lambda u: "fileaxa.com" in u,
-                timeout=60_000,
-            )
-        except PWTimeout:
+        import time as _t
+        deadline = _t.monotonic() + 120.0
+        last_log = 0.0
+        while _t.monotonic() < deadline:
+            if "fileaxa.com" in page.url:
+                break
+            if cancel_check():
+                raise CancelledError()
+            elapsed = int(120.0 - (deadline - _t.monotonic()))
+            if elapsed and elapsed % 10 == 0 and elapsed != last_log:
+                last_log = elapsed
+                if on_log is not None:
+                    on_log(
+                        f"still waiting for redirect ({elapsed}s elapsed; "
+                        f"may need to solve Cloudflare challenge in the browser)"
+                    )
+            try:
+                page.wait_for_timeout(500)
+            except Exception:
+                break
+        else:
             raise TimeoutError(
-                "did not redirect to fileaxa within 60s "
-                "(wait page may have changed)"
+                "did not redirect to fileaxa within 120s "
+                "(Cloudflare challenge not solved or wait page changed)"
             )
         if cancel_check():
             raise CancelledError()
