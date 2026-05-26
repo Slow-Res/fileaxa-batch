@@ -5,6 +5,7 @@ from typing import List, Optional
 
 from PyQt6.QtCore import QThread
 from playwright.sync_api import sync_playwright
+from playwright_stealth import Stealth
 
 from ..api.client import FileaxaClient
 from ..api.errors import ApiError, AuthError
@@ -153,6 +154,20 @@ class DownloadWorker(QThread):
                 )
                 context = browser.new_context(accept_downloads=True)
                 page = context.new_page()
+                # Patch the page to evade Cloudflare Turnstile / bot
+                # detection: navigator.webdriver -> undefined, real
+                # chrome.runtime, plausible plugin list, WebGL vendor
+                # string, etc. Without this, the launch flags we set
+                # above (--no-sandbox, --disable-gpu, --no-zygote) trip
+                # CF's automation heuristics. Stealth restores the
+                # browser fingerprint at the JS-runtime layer.
+                try:
+                    Stealth().apply_stealth_sync(page)
+                except Exception as e:
+                    self.signals.worker_log.emit(
+                        f"worker {self.worker_id}: stealth setup failed "
+                        f"({type(e).__name__}: {e}); continuing without it"
+                    )
                 try:
                     self._loop(page, api_client)
                 finally:
