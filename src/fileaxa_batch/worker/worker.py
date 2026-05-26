@@ -143,15 +143,16 @@ class DownloadWorker(QThread):
                 browser = p.chromium.launch(headless=headless)
                 context = browser.new_context(accept_downloads=True)
                 page = context.new_page()
-                # Patch the page to evade bot detection. Using the
-                # library's defaults — earlier we tried chrome_runtime=True
-                # for Cloudflare specifically but it appears to break
-                # page rendering, leaving the browser stuck on a blank /
-                # half-loaded challenge page. The safer defaults still
-                # handle navigator.webdriver, plugin list, WebGL vendor
-                # etc., which is the bulk of bot signals anyway.
+                # Patch the page to evade bot detection. Key consistency
+                # fix: navigator.platform must match the user-agent OS.
+                # The library defaults to Win32 (most users want to look
+                # like Windows) but our Chrome UA still says X11; Linux —
+                # the mismatch IS a Cloudflare bot signal. Force the
+                # platform to Linux so navigator.platform aligns with UA.
                 try:
-                    Stealth().apply_stealth_sync(page)
+                    Stealth(
+                        navigator_platform_override="Linux x86_64",
+                    ).apply_stealth_sync(page)
                 except Exception as e:
                     self.signals.worker_log.emit(
                         f"worker {self.worker_id}: stealth setup failed "
