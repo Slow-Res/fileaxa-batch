@@ -134,7 +134,15 @@ class DownloadWorker(QThread):
                         f"worker {self.worker_id}: redirector URL detected, "
                         f"running headed"
                     )
-                browser = p.chromium.launch(headless=headless)
+                # --disable-gpu skips Chromium's GPU process, which on
+                # Linux holds an X11 GLX context plus several utility slots.
+                # --disable-software-rasterizer prevents the GPU process
+                # from being respawned for software fallback. Together they
+                # save ~3-5 X client slots per Chromium instance.
+                browser = p.chromium.launch(
+                    headless=headless,
+                    args=["--disable-gpu", "--disable-software-rasterizer"],
+                )
                 context = browser.new_context(accept_downloads=True)
                 page = context.new_page()
                 try:
