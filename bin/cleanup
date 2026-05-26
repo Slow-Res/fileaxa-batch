@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Reap orphan Playwright Chromium processes from previous sessions.
+#
+# Use when bin/start fails with "Maximum number of clients reached" or
+# "Could not open X display" — that means a previous SIGKILL'd or crashed
+# fileaxa-batch session left Chromium subprocesses running, and the X
+# server is out of client slots.
+#
+# This script is intentionally GUI-free: no PyQt6, no playwright module
+# import, nothing that would itself try to connect to X. It just walks
+# /proc and kills matching processes.
+set -euo pipefail
+
+SOURCE=${BASH_SOURCE[0]}
+while [[ -L "$SOURCE" ]]; do
+    SOURCE_DIR=$(cd -P "$(dirname "$SOURCE")" >/dev/null && pwd)
+    SOURCE=$(readlink "$SOURCE")
+    [[ "$SOURCE" != /* ]] && SOURCE="$SOURCE_DIR/$SOURCE"
+done
+SCRIPT_DIR=$(cd -P "$(dirname "$SOURCE")" >/dev/null && pwd)
+PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+
+VENV_PY="$PROJECT_ROOT/.venv/bin/python"
+[[ -x "$VENV_PY" ]] || VENV_PY="python3"
+
+# Run cleanup via a tiny inline Python that DOES NOT import any GUI
+# module — only the cleanup function which only uses /proc + os.kill.
+"$VENV_PY" -c "
+import sys
+sys.path.insert(0, '$PROJECT_ROOT/src')
+from fileaxa_batch.core.cleanup import find_orphan_chromiums, kill_orphan_chromiums
+orphans = find_orphan_chromiums()
+print(f'orphan Chromium processes from previous sessions: {len(orphans)}')
+if orphans:
+    print(f'  PIDs: {orphans}')
+    killed = kill_orphan_chromiums()
+    print(f'killed: {killed}')
+"
+
+# Also print a snapshot of X11 client usage for diagnostic.
+if command -v xlsclients >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+    n=$(xlsclients 2>/dev/null | wc -l || echo "?")
+    echo
+    echo "Current X11 windowed clients on \$DISPLAY=$DISPLAY: $n"
+    echo "(this counts only top-level windows — actual connection count is higher)"
+fi

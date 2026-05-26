@@ -31,4 +31,13 @@ EOF
     exit 1
 fi
 
+# Pre-launch sweep: kill any Playwright Chromium subprocesses left over
+# from a SIGKILL'd or crashed prior session. The app does the same scan
+# inside main() but it can be too late — if the X server is already at
+# its client cap, PyQt6's platform-plugin probe can fail before main()
+# runs. pkill needs no X and no Python imports.
+if pkill -9 -f playwright_chromiumdev_profile 2>/dev/null; then
+    echo "swept orphan Chromium(s) from previous session" >&2
+fi
+
 exec "$VENV_PY" -m fileaxa_batch "$@"
