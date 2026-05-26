@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Print a snapshot of what's using your X11 connection slots.
 # Helpful when bin/start fails with "Maximum number of clients reached".
-set -euo pipefail
+#
+# Deliberately NOT using `set -e` — diagnostic scripts should print every
+# section they can even when individual probes (xlsclients, pgrep with no
+# matches, ss without root) fail. Each command guards its own errors.
 
 DISP=${DISPLAY:-:0}
 
@@ -12,34 +15,38 @@ fi
 echo
 
 if command -v xlsclients >/dev/null 2>&1; then
-    n_windowed=$(xlsclients -a -display "$DISP" 2>/dev/null | wc -l || echo "?")
+    # xlsclients itself opens an X connection, so it can fail when the
+    # server is at its cap. Stderr's already suppressed; -p forces line-buffered.
+    n_windowed=$(xlsclients -display "$DISP" 2>/dev/null | wc -l)
+    [[ -z "$n_windowed" ]] && n_windowed="(?)"
     echo "Windowed X clients (with top-level windows): $n_windowed"
-    echo "(This is a LOWER bound — many connections have no window.)"
+    echo "(Lower bound — many connections have no window.)"
     echo
 fi
 
 echo "=== Chrome / Chromium-family processes for $USER ==="
-# Each subprocess that talks to X counts as a separate X client.
-chrome_total=$(pgrep -u "$USER" -fc "chrome|chromium" 2>/dev/null || echo 0)
-chrome_google=$(pgrep -u "$USER" -fc "/opt/google/chrome" 2>/dev/null || echo 0)
-chrome_playwright=$(pgrep -u "$USER" -fc "playwright_chromiumdev_profile" 2>/dev/null || echo 0)
-echo "  Total chrome/chromium processes:       $chrome_total"
-echo "  Of which regular Google Chrome:        $chrome_google"
-echo "  Of which Playwright (fileaxa-batch):   $chrome_playwright"
+chrome_total=$(pgrep -u "$USER" -fc "chrome|chromium" 2>/dev/null)
+chrome_google=$(pgrep -u "$USER" -fc "/opt/google/chrome" 2>/dev/null)
+chrome_playwright=$(pgrep -u "$USER" -fc "playwright_chromiumdev_profile" 2>/dev/null)
+echo "  Total chrome/chromium processes:       ${chrome_total:-0}"
+echo "  Of which regular Google Chrome:        ${chrome_google:-0}"
+echo "  Of which Playwright (fileaxa-batch):   ${chrome_playwright:-0}"
 echo
 
-echo "=== Top 10 X-using processes (by FD count to /tmp/.X11-unix) ==="
-# Each open FD to the X socket is one connection.
-sock_glob="/tmp/.X11-unix/*"
-declare -A by_proc
-shopt -s nullglob
-for sock in $sock_glob; do
-    inode=$(stat -c '%i' "$sock" 2>/dev/null || echo "")
-    [[ -n "$inode" ]] || continue
-done
-shopt -u nullglob
-ss -xp 2>/dev/null | awk '/X11-unix/ && match($0, /"([^"]+)",pid=([0-9]+)/, m) { print m[1] }' \
-    | sort | uniq -c | sort -rn | head -10 || true
+echo "=== Top 10 processes by open FDs to /tmp/.X11-unix ==="
+# Walk /proc/<pid>/fd and look for symlinks pointing into the X socket dir.
+# Works without root for processes the user owns; silently skips others.
+{
+    for fd_dir in /proc/[0-9]*/fd; do
+        pid="${fd_dir%/fd}"
+        pid="${pid#/proc/}"
+        cnt=$(ls -l "$fd_dir" 2>/dev/null | grep -c "/tmp/.X11-unix/")
+        [[ "$cnt" -gt 0 ]] || continue
+        # Get the command name (truncated, like ps shows it)
+        comm=$(tr -d '\0' < "/proc/$pid/comm" 2>/dev/null || echo "?")
+        printf "%4d  pid=%-6s  %s\n" "$cnt" "$pid" "$comm"
+    done
+} | sort -rn | head -10
 
 echo
 echo "=== Suggestions if you're hitting the cap ==="
