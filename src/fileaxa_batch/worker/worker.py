@@ -10,6 +10,7 @@ from ..api.client import FileaxaClient
 from ..api.errors import ApiError, AuthError
 from ..core.models import DownloadJob, FileMeta, JobStatus
 from ..core.settings import AppSettings, Mode
+from ..core.urls import parse_file_code
 from ..secrets import get_api_key
 from .browser import CancelledError, PausedAtOffset, download_one
 from .signals import WorkerSignals
@@ -107,11 +108,33 @@ class DownloadWorker(QThread):
 
     # ---- worker loop ----
 
+    def _effective_headless(self) -> bool:
+        """Override headless=True when the queue contains any non-fileaxa
+        URL. Redirector pages may require user interaction (captcha,
+        click-through, browser fingerprint checks) that headless modes
+        often fail. Detected by URL alone — JobClaimer only ever serves
+        URLs that parse_file_code accepted, so a non-fileaxa pending URL
+        is by definition a redirector."""
+        if not self.settings.headless:
+            return False
+        for job in self.jobs:
+            if job.status != JobStatus.PENDING:
+                continue
+            if "fileaxa.com" not in job.url:
+                return False
+        return True
+
     def run(self) -> None:
         api_client = self._open_api_client_if_enabled()
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=self.settings.headless)
+                headless = self._effective_headless()
+                if self.settings.headless and not headless:
+                    self.signals.worker_log.emit(
+                        f"worker {self.worker_id}: redirector URL detected, "
+                        f"running headed"
+                    )
+                browser = p.chromium.launch(headless=headless)
                 context = browser.new_context(accept_downloads=True)
                 page = context.new_page()
                 try:
@@ -260,6 +283,9 @@ class DownloadWorker(QThread):
                 on_log=self.signals.worker_log.emit,
                 pause_check=self._paused.is_set,
                 resume_target=resume_target,
+                on_resolved_url=lambda canonical, _idx=idx, _job=job: self._on_resolved_url(
+                    _idx, _job, canonical
+                ),
             )
             job.dest_path = path
             job.status = JobStatus.COMPLETED
@@ -282,6 +308,24 @@ class DownloadWorker(QThread):
             job.status = JobStatus.FAILED
             job.error = f"{type(e).__name__}: {e}"
             self.signals.job_failed.emit(idx, job.error)
+
+    def _on_resolved_url(
+        self, idx: int, job: DownloadJob, canonical: str
+    ) -> None:
+        """Replace the redirector URL with the canonical fileaxa URL once
+        the page exposes it. Also re-derive file_code so dedup recognises
+        future pastes of the same URL via either source."""
+        if job.url == canonical:
+            return
+        self.signals.worker_log.emit(
+            f"resolved: {job.url} -> {canonical}"
+        )
+        job.url = canonical
+        new_code = parse_file_code(canonical)
+        if new_code:
+            job.file_code = new_code
+        # Bounce a status_changed so the GUI table refreshes the URL cell.
+        self.signals.status_changed.emit(idx, job.status.value)
 
     def _on_status(self, idx: int, job: DownloadJob, s: str) -> None:
         job.status = _status_to_enum(s)

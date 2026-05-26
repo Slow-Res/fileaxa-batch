@@ -304,6 +304,7 @@ def download_one(
     on_log: Optional[Callable[[str], None]] = None,
     pause_check: Optional[Callable[[], bool]] = None,
     resume_target: Optional[Path] = None,
+    on_resolved_url: Optional[Callable[[str], None]] = None,
 ) -> Path:
     """Drive one Fileaxa free-tier download. Returns the saved path.
 
@@ -359,6 +360,21 @@ def download_one(
             page.wait_for_load_state("domcontentloaded", timeout=15_000)
         except PWTimeout:
             pass
+
+        # The fileaxa download page exposes the canonical URL inside a
+        # .dl0-meta <font> element ("You have requested <font>https://...</font>").
+        # Pulling it lets us replace the redirector URL with the real
+        # fileaxa link in the queue — future resumes skip the 20s wait,
+        # and the table row displays the right URL.
+        if on_resolved_url is not None:
+            try:
+                text = page.locator(".dl0-meta font").first.inner_text(
+                    timeout=5000
+                ).strip()
+                if text.startswith("https://fileaxa.com/"):
+                    on_resolved_url(text)
+            except Exception:
+                pass  # selector miss is fine; we keep the redirector URL
 
     on_status("clicking free button")
     clicked = _try_click(page, _FREE_BUTTON_SELECTORS)
