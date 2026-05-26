@@ -204,9 +204,16 @@ class DownloadWorker(QThread):
                 continue
             idx = self.claimer.claim_next()
             if idx is None:
-                if self._stop.wait(timeout=0.5):
-                    break
-                continue
+                # Queue drained from THIS worker's perspective. Exit the
+                # loop so Playwright tears the Chromium down and the
+                # thread terminates. User clicks Start to spawn a fresh
+                # worker when they have new URLs. Other concurrent workers
+                # keep running on their own claimed jobs — A exiting
+                # doesn't disturb B or C.
+                self.signals.worker_log.emit(
+                    f"worker {self.worker_id}: queue drained, exiting"
+                )
+                break
             self._cancel_current.clear()
             self._process(idx, page, api_client)
 
